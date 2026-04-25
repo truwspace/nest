@@ -1,1 +1,2 @@
-# nest
+Nested embedding search tool 
+Landing do motor opensource de busca semântica embarcado do truw , "nest" Nested embedding search tool  ou (ninho). Funciona single file storage para vector /sqlite para embedings local first sem necessidade de infra. Serve para armazenar/comprimir informaçoes para agentics, llms, chunks de aprendizados. Comprime blocos de texto com zstd, FAISS IVF+PQ p/ nearest, metadados, etc. 
