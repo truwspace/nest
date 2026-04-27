@@ -1,2 +1,45 @@
+/target
+/Cargo.lock
+**/*.rs.bk
+*.pdb
+*.so
+*.dylib
+*.dll
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+wheels/
+.pytest_cache/
+.mypy_cache/
+.python-version
+
+# Virtual environments
+.venv
+venv/
+env/
+
+# OS
 .DS_Store
-database/
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Project specific
+/database
+/data/*.nest
+/data/*.nest-*
+
+# Documentation not requested
+CHANGELOG.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
