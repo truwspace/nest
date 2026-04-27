@@ -39,6 +39,8 @@ Thumbs.db
 /data/*.nest
 /data/*.nest-*
 
+kdb/
+adr/
 # Documentation not requested
 CODE_OF_CONDUCT.md
 CONTRIBUTING.md
