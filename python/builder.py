@@ -20,7 +20,6 @@ import json
 import os
 import sqlite3
 import struct
-import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
@@ -170,18 +169,10 @@ class Pipeline:
         *,
         embedder: Callable[[Sequence[ChunkSpec]], list[Sequence[float]]],
         scratch_db: str | None = None,
-        nest_bin: str | None = None,
     ):
         self.cfg = cfg
         self.embedder = embedder
         self.cache = EmbeddingCache(scratch_db) if scratch_db else None
-        self.nest_bin = nest_bin or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..",
-            "target",
-            "release",
-            "nest",
-        )
         self._specs: list[ChunkSpec] = []
 
     def add(self, spec: ChunkSpec) -> None:
@@ -260,15 +251,10 @@ class Pipeline:
             reproducible=self.cfg.reproducible,
         )
 
-        out = subprocess.run(
-            [self.nest_bin, "validate", self.cfg.output_path],
-            capture_output=True,
-            text=True,
-        )
-        if out.returncode != 0:
-            raise RuntimeError(
-                f"nest validate failed:\n{out.stderr}\n{out.stdout}"
-            )
+        # Final integrity check via the in-process reader (PyO3 path).
+        # No CLI subprocess: one Python entry point only.
+        db = nest.open(self.cfg.output_path)
+        db.validate()
         return self.cfg.output_path
 
     def close(self) -> None:

@@ -1,19 +1,19 @@
-"""End-to-end test: build a .nest from Python, then search via Python and CLI."""
-import os
-import sys
-import json
+"""End-to-end test of the Python (PyO3) path.
+
+The CLI binary is exhaustively tested in `crates/nest-cli/tests/cli_e2e.rs`.
+This file stays on a single Python entry point: PyO3 only. No subprocess
+shell-out — `nest validate / stats / search / cite / inspect` all have
+in-process equivalents through `nest.NestFile`.
+"""
 import math
+import os
 import random
+import sys
 import tempfile
-import subprocess
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 import nest
-
-NEST_BIN = os.path.join(
-    os.path.dirname(__file__), "..", "target", "release", "nest"
-)
 
 
 def _unit_vec(rng: random.Random, dim: int) -> list[float]:
@@ -75,28 +75,31 @@ def test_python_build_then_python_search():
         os.unlink(path)
 
 
-def test_python_build_then_cli():
+def test_validate_via_pyo3():
     with tempfile.NamedTemporaryFile(delete=False, suffix=".nest") as f:
         path = f.name
     try:
         make_nest(path, dim=4, n=5)
-
-        out = subprocess.run([NEST_BIN, "validate", path], capture_output=True, text=True)
-        assert out.returncode == 0, out.stderr
-        assert "valid .nest v1 file" in out.stdout
-
-        out = subprocess.run([NEST_BIN, "stats", path], capture_output=True, text=True)
-        assert out.returncode == 0, out.stderr
-        assert "chunks:       5" in out.stdout
-        assert "metric:       ip" in out.stdout
-
-        q = json.dumps([1.0, 0.0, 0.0, 0.0])
-        out = subprocess.run(
-            [NEST_BIN, "search", path, q, "-k", "1"], capture_output=True, text=True
-        )
-        assert out.returncode == 0, out.stderr
-        assert "citation_id=nest://sha256:" in out.stdout
-        print("cli validate/stats/search OK")
+        db = nest.open(path)
+        assert db.validate() is True
+        info = db.inspect()
+        assert info["magic"] == "NEST"
+        assert info["n_chunks"] == 5
+        assert info["manifest"]["dtype"] == "float32"
+        assert info["manifest"]["metric"] == "ip"
+        names = {s["name"] for s in info["sections"]}
+        assert names == {
+            "chunk_ids",
+            "chunks_canonical",
+            "chunks_original_spans",
+            "embeddings",
+            "provenance",
+            "search_contract",
+        }
+        for s in info["sections"]:
+            assert s["offset"] % 64 == 0
+            assert s["encoding"] == 0
+        print("pyo3 validate/inspect OK")
     finally:
         os.unlink(path)
 
@@ -111,32 +114,43 @@ def test_reproducible_builds_match_byte_for_byte():
             data_a = fa.read()
             data_b = fb.read()
         assert data_a == data_b, "reproducible builds diverged"
-        print("reproducible build OK:", len(data_a), "bytes")
+
+        # And the file_hash from a third in-process open must match too.
+        ha = nest.open(a).file_hash
+        hb = nest.open(b).file_hash
+        assert ha == hb
+        print("reproducible build OK:", len(data_a), "bytes,", ha[:32])
 
 
-def test_cite_resolves_citation():
+def test_search_hit_carries_full_contract():
+    """Every required SearchHit field per SPEC.md §16 is populated and stable."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".nest") as f:
         path = f.name
     try:
         make_nest(path, dim=4, n=3)
         db = nest.open(path)
-        hits = db.search([1.0, 0.0, 0.0, 0.0], 1)
-        cit = hits[0].citation_id
+        h = db.search([1.0, 0.0, 0.0, 0.0], 1)[0]
 
-        out = subprocess.run(
-            [NEST_BIN, "cite", path, cit], capture_output=True, text=True
-        )
-        assert out.returncode == 0, out.stderr
-        assert "source_uri:" in out.stdout
-        assert "byte_start:" in out.stdout
-        assert "text:" in out.stdout
-        print("cite OK")
+        # Required fields
+        assert isinstance(h.chunk_id, str) and h.chunk_id.startswith("sha256:")
+        assert isinstance(h.score, float)
+        assert h.score_type == "cosine"
+        assert isinstance(h.source_uri, str) and h.source_uri
+        assert isinstance(h.offset_start, int) and h.offset_start >= 0
+        assert isinstance(h.offset_end, int) and h.offset_end >= h.offset_start
+        assert h.embedding_model == "test-model"
+        assert h.index_type == "exact"
+        assert h.reranked is False
+        assert h.file_hash.startswith("sha256:")
+        assert h.content_hash.startswith("sha256:")
+        assert h.citation_id == f"nest://{h.content_hash}/{h.chunk_id}"
+        print("search hit contract OK")
     finally:
         os.unlink(path)
 
 
 if __name__ == "__main__":
     test_python_build_then_python_search()
-    test_python_build_then_cli()
+    test_validate_via_pyo3()
     test_reproducible_builds_match_byte_for_byte()
-    test_cite_resolves_citation()
+    test_search_hit_carries_full_contract()

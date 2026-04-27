@@ -46,6 +46,26 @@ impl NestFile {
     fn content_hash(&self) -> String {
         self.rt.content_hash().to_string()
     }
+
+    /// Mirror of `nest inspect`: returns a Python dict with header,
+    /// section table, manifest and hashes.
+    fn inspect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let s = self
+            .rt
+            .inspect_json()
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        py.import("json")?.call_method1("loads", (s,))
+    }
+
+    /// Re-run reader-side validation. Returns `True` on success and
+    /// raises `ValueError` (with the reader's typed error in the
+    /// message) on any failure.
+    fn validate(&self) -> PyResult<bool> {
+        self.rt
+            .revalidate()
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        Ok(true)
+    }
 }
 
 #[pyclass(skip_from_py_object)]
@@ -145,9 +165,9 @@ fn build(
     provenance: Option<&Bound<PyDict>>,
     reproducible: bool,
 ) -> PyResult<String> {
+    use nest_format::ChunkInput;
     use nest_format::manifest::Manifest;
     use nest_format::writer::NestFileBuilder;
-    use nest_format::ChunkInput;
 
     let n_chunks = chunks.len() as u64;
     let mut chunk_inputs: Vec<ChunkInput> = Vec::with_capacity(n_chunks as usize);
@@ -188,10 +208,7 @@ fn build(
 
     let provenance_value = match provenance {
         Some(p) => {
-            let s: String = py
-                .import("json")?
-                .call_method1("dumps", (p,))?
-                .extract()?;
+            let s: String = py.import("json")?.call_method1("dumps", (p,))?.extract()?;
             serde_json::from_str(&s)
                 .map_err(|e| PyValueError::new_err(format!("provenance JSON: {}", e)))?
         }

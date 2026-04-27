@@ -19,7 +19,6 @@ import json
 import os
 import struct
 import sqlite3
-import subprocess
 import sys
 import time
 
@@ -63,7 +62,7 @@ def load_embeddings(conn: sqlite3.Connection, n: int, dim: int) -> np.ndarray:
     return arr / norms
 
 
-def convert(src: str, dst: str, *, reproducible: bool, validate_bin: str) -> None:
+def convert(src: str, dst: str, *, reproducible: bool) -> None:
     if not os.path.exists(src):
         raise SystemExit(f"source not found: {src}")
 
@@ -155,11 +154,16 @@ def convert(src: str, dst: str, *, reproducible: bool, validate_bin: str) -> Non
     size = os.path.getsize(dst)
     print(f"wrote {dst}: {size/1e6:.2f} MB in {elapsed:.1f}s")
 
-    # Final integrity check via the CLI.
-    out = subprocess.run([validate_bin, "validate", dst], capture_output=True, text=True)
-    if out.returncode != 0:
-        raise SystemExit(f"nest validate failed:\n{out.stderr}\n{out.stdout}")
-    print(out.stdout.strip())
+    # Final integrity check through the same Rust reader the runtime uses.
+    db = nest.open(dst)
+    db.validate()
+    print(
+        f"validated: {dst}\n"
+        f"  file_hash:    {db.file_hash}\n"
+        f"  content_hash: {db.content_hash}\n"
+        f"  chunks:       {db.n_embeddings}\n"
+        f"  dim:          {db.embedding_dim}"
+    )
 
 
 def main():
@@ -167,12 +171,8 @@ def main():
     p.add_argument("--src", default="data/truw_ptbr.nest")
     p.add_argument("--dst", default="data/truw_ptbr.v1.nest")
     p.add_argument("--reproducible", action="store_true")
-    p.add_argument(
-        "--nest-bin",
-        default=os.path.join(os.path.dirname(__file__), "..", "target", "release", "nest"),
-    )
     args = p.parse_args()
-    convert(args.src, args.dst, reproducible=args.reproducible, validate_bin=args.nest_bin)
+    convert(args.src, args.dst, reproducible=args.reproducible)
 
 
 if __name__ == "__main__":

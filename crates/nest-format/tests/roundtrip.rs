@@ -96,9 +96,12 @@ fn same_input_same_hash() {
     let v1 = NestView::from_bytes(&b1).unwrap();
     let v2 = NestView::from_bytes(&b2).unwrap();
     assert_eq!(v1.file_hash_hex(), v2.file_hash_hex());
-    assert_eq!(v1.content_hash_hex(), v2.content_hash_hex());
+    assert_eq!(
+        v1.content_hash_hex().unwrap(),
+        v2.content_hash_hex().unwrap()
+    );
     assert!(v1.file_hash_hex().starts_with("sha256:"));
-    assert!(v1.content_hash_hex().starts_with("sha256:"));
+    assert!(v1.content_hash_hex().unwrap().starts_with("sha256:"));
 }
 
 #[test]
@@ -411,7 +414,7 @@ fn citation_id_uses_content_hash_with_nest_scheme() {
         .build_bytes()
         .unwrap();
     let view = NestView::from_bytes(&bytes).unwrap();
-    let content_hash = view.content_hash_hex();
+    let content_hash = view.content_hash_hex().unwrap();
     assert!(content_hash.starts_with("sha256:"));
     let hex_part = content_hash.strip_prefix("sha256:").unwrap();
     assert_eq!(hex_part.len(), 64);
@@ -617,10 +620,7 @@ fn reader_rejects_misaligned_section() {
 
     let res = NestView::from_bytes(&bytes);
     assert!(
-        matches!(
-            res,
-            Err(nest_format::NestError::SectionMisaligned { .. })
-        ),
+        matches!(res, Err(nest_format::NestError::SectionMisaligned { .. })),
         "expected SectionMisaligned, got {:?}",
         res.err()
     );

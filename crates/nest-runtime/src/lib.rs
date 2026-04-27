@@ -72,7 +72,7 @@ impl MmapNestFile {
 
         let embedding_model = view.manifest.embedding_model.clone();
         let file_hash = view.file_hash_hex();
-        let content_hash = view.content_hash_hex();
+        let content_hash = view.content_hash_hex()?;
         drop(view);
 
         Ok(Self {
@@ -99,6 +99,60 @@ impl MmapNestFile {
     }
     pub fn content_hash(&self) -> &str {
         &self.content_hash
+    }
+
+    /// Re-parse the mmap and return a JSON document mirroring `nest
+    /// inspect`: header fields, section table entries, manifest, and
+    /// the file/content hashes. Cheap (microseconds) — the file is
+    /// already mapped.
+    pub fn inspect_json(&self) -> Result<String, RuntimeError> {
+        let view = NestView::from_bytes(&self._mmap)?;
+        let magic = std::str::from_utf8(&view.header.magic)
+            .unwrap_or("")
+            .to_string();
+        let sections: Vec<serde_json::Value> = view
+            .section_table
+            .iter()
+            .map(|e| {
+                let name = nest_format::layout::section_name(e.section_id).unwrap_or("unknown");
+                serde_json::json!({
+                    "section_id": e.section_id,
+                    "name": name,
+                    "encoding": e.encoding,
+                    "offset": e.offset,
+                    "size": e.size,
+                    "checksum": hex::encode(e.checksum),
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "magic": magic,
+            "version_major": view.header.version_major,
+            "version_minor": view.header.version_minor,
+            "format_version": view.manifest.format_version,
+            "schema_version": view.manifest.schema_version,
+            "embedding_dim": view.header.embedding_dim,
+            "n_chunks": view.header.n_chunks,
+            "n_embeddings": view.header.n_embeddings,
+            "file_size": view.header.file_size,
+            "manifest": view.manifest,
+            "sections": sections,
+            "file_hash": view.file_hash_hex(),
+            "content_hash": view.content_hash_hex()?,
+        });
+        serde_json::to_string(&doc)
+            .map_err(|e| RuntimeError::Format(nest_format::NestError::Json(e)))
+    }
+
+    /// Re-run all reader-side validation. The file was already
+    /// validated at `open()` time, but callers can invoke this
+    /// explicitly to detect tampering after the fact (e.g. the mmap
+    /// pages got swapped under the runtime).
+    pub fn revalidate(&self) -> Result<(), RuntimeError> {
+        let view = NestView::from_bytes(&self._mmap)?;
+        view.validate_embeddings_values()?;
+        let _ = view.search_contract()?;
+        Ok(())
     }
 
     pub fn search(&self, query: &[f32], k: i32) -> Result<SearchResult, RuntimeError> {

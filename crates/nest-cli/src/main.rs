@@ -81,7 +81,7 @@ fn cmd_inspect(file: PathBuf) -> Result<()> {
         serde_json::to_string_pretty(&view.manifest)?
     );
     println!("File hash:    {}", view.file_hash_hex());
-    println!("Content hash: {}", view.content_hash_hex());
+    println!("Content hash: {}", view.content_hash_hex()?);
     Ok(())
 }
 
@@ -101,7 +101,7 @@ fn cmd_validate(file: PathBuf) -> Result<()> {
     println!("  Required sections:  all present");
     println!("  Embedding values:   no NaN/Inf");
     println!("  File hash:          {}", view.file_hash_hex());
-    println!("  Content hash:       {}", view.content_hash_hex());
+    println!("  Content hash:       {}", view.content_hash_hex()?);
     Ok(())
 }
 
@@ -197,15 +197,17 @@ fn cmd_cite(file: PathBuf, citation: String) -> Result<()> {
         Some((first, _)) => first,
         None => chunk_id_part,
     };
-    let expected_content_hash = format!("sha256:{}", content_hash_part.trim_start_matches("sha256:"));
+    let expected_content_hash =
+        format!("sha256:{}", content_hash_part.trim_start_matches("sha256:"));
 
     let data = std::fs::read(&file)?;
     let view = nest_format::NestView::from_bytes(&data)?;
-    if view.content_hash_hex() != expected_content_hash {
+    let actual_content_hash = view.content_hash_hex()?;
+    if actual_content_hash != expected_content_hash {
         anyhow::bail!(
             "content_hash mismatch: citation says {} but file is {}",
             expected_content_hash,
-            view.content_hash_hex()
+            actual_content_hash
         );
     }
 
@@ -232,7 +234,7 @@ fn cmd_cite(file: PathBuf, citation: String) -> Result<()> {
     println!("citation_id:  {}", citation);
     println!("file:         {}", file.display());
     println!("file_hash:    {}", view.file_hash_hex());
-    println!("content_hash: {}", view.content_hash_hex());
+    println!("content_hash: {}", actual_content_hash);
     println!("chunk_id:     {}", chunk_id);
     println!("source_uri:   {}", span.source_uri);
     println!("byte_start:   {}", span.byte_start);
@@ -268,6 +270,6 @@ fn cmd_stats(file: PathBuf) -> Result<()> {
         );
     }
     println!("file_hash:    {}", view.file_hash_hex());
-    println!("content_hash: {}", view.content_hash_hex());
+    println!("content_hash: {}", view.content_hash_hex()?);
     Ok(())
 }

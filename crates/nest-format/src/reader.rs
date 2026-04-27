@@ -281,16 +281,15 @@ impl<'a> NestView<'a> {
 
     /// `sha256:<hex>` of the canonical sections in the order fixed by spec
     /// (see `CANONICAL_SECTIONS`). Adding a section with a smaller numeric
-    /// id cannot reshuffle this hash.
-    pub fn content_hash_hex(&self) -> String {
+    /// id cannot reshuffle this hash. All required sections were proved
+    /// present at construction time, so in practice this never returns
+    /// `Err`; the `Result` is preserved so callers never have to absorb
+    /// a panic.
+    pub fn content_hash_hex(&self) -> crate::Result<String> {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         for (id, name) in CANONICAL_SECTIONS {
-            // All listed sections are required and were proved present at
-            // construction time, so this lookup cannot fail.
-            let data = self
-                .get_section_data(*id)
-                .expect("required section present");
+            let data = self.get_section_data(*id)?;
             // Domain-separate by name length + name bytes so hashes for
             // different sections cannot collide via concatenation.
             h.update((name.len() as u32).to_le_bytes());
@@ -298,6 +297,6 @@ impl<'a> NestView<'a> {
             h.update((data.len() as u64).to_le_bytes());
             h.update(data);
         }
-        format!("sha256:{:x}", h.finalize())
+        Ok(format!("sha256:{:x}", h.finalize()))
     }
 }

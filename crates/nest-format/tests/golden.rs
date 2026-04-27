@@ -78,7 +78,7 @@ fn golden_file_header_bytes() {
 fn golden_file_hashes_unchanged() {
     let view = NestView::from_bytes(GOLDEN).unwrap();
     assert_eq!(view.file_hash_hex(), GOLDEN_FILE_HASH);
-    assert_eq!(view.content_hash_hex(), GOLDEN_CONTENT_HASH);
+    assert_eq!(view.content_hash_hex().unwrap(), GOLDEN_CONTENT_HASH);
 }
 
 #[test]

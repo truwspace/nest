@@ -1,7 +1,7 @@
+use nest_format::ChunkInput;
 use nest_format::manifest::Manifest;
 use nest_format::reader::NestView;
 use nest_format::writer::NestFileBuilder;
-use nest_format::ChunkInput;
 
 fn main() {
     let m = Manifest {
@@ -29,7 +29,7 @@ fn main() {
     let view = NestView::from_bytes(&bytes).unwrap();
     println!("GOLDEN_LEN = {}", bytes.len());
     println!("GOLDEN_FILE_HASH = {}", view.file_hash_hex());
-    println!("GOLDEN_CONTENT_HASH = {}", view.content_hash_hex());
+    println!("GOLDEN_CONTENT_HASH = {}", view.content_hash_hex().unwrap());
     let ids = nest_format::sections::decode_chunk_ids(
         view.get_section_data(nest_format::layout::SECTION_CHUNK_IDS)
             .unwrap(),

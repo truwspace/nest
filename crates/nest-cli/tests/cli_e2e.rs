@@ -139,16 +139,15 @@ fn cli_cite_resolves_citation() {
     assert!(stdout.contains("text_"));
 
     // Mismatched content_hash → cite must fail loudly.
-    let bogus = format!(
-        "nest://sha256:{}/sha256:{}",
-        "0".repeat(64),
-        "0".repeat(64)
-    );
+    let bogus = format!("nest://sha256:{}/sha256:{}", "0".repeat(64), "0".repeat(64));
     let out = Command::new(bin)
         .args(["cite", path.to_str().unwrap(), &bogus])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "cite should reject content_hash mismatch");
+    assert!(
+        !out.status.success(),
+        "cite should reject content_hash mismatch"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
