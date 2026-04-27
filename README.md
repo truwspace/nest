@@ -4,7 +4,7 @@ portable binary format for distributing semantic knowledge bases. one file carri
 
 built by truw to run 100 percent local, no server, with cryptographic integrity and traceable citation.
 
-python builds. rust runs. nest packages. agents consume.
+python builds. rust serves. nest ships. agents read.
 
 install
 
@@ -26,7 +26,7 @@ nest search <file> <qvec> -k K   exact top-k, query is a JSON array of f32
 nest cite <file> <citation>      resolves nest://<content_hash>/<chunk_id>
 ```
 
-search takes a vector, not text. embedding text stays in python. deliberate v1 decision.
+search takes a vector, not text. embed text in python and pass the vector. deliberate v1 decision.
 
 python
 
