@@ -15,6 +15,9 @@ sha2 = { workspace = true }
 half = { workspace = true }
 hex = "0.4"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lib]
 name = "nest_runtime"
 path = "src/lib.rs"

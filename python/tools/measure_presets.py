@@ -19,9 +19,11 @@ Pipeline:
 Output: a markdown table to stdout. No artifacts persisted beyond the
 variant `.nest` files (under `data/measure/`) so the run is rerunnable.
 """
+
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import sys
@@ -44,7 +46,7 @@ def _decode_baseline(path: Path):
     info = db.inspect()
     n = db.n_embeddings
     dim = db.embedding_dim
-    print(f"baseline: {path}  n={n} dim={dim} dtype={db.dtype}")
+    print(f"baseline: {path}  n={n} dim={dim} dtype={db.dtype}", file=sys.stderr)
 
     # Re-derive embeddings: easier to query the unit-vector basis we want
     # via search? No — we need the actual stored vectors. Easiest path:
@@ -61,11 +63,11 @@ def _decode_baseline(path: Path):
     chunk_ids_payload = None
     for i in range(section_table_count):
         eoff = section_table_offset + i * 32
-        sid = int.from_bytes(raw[eoff:eoff + 4], "little")
-        enc = int.from_bytes(raw[eoff + 4:eoff + 8], "little")
-        off = int.from_bytes(raw[eoff + 8:eoff + 16], "little")
-        size = int.from_bytes(raw[eoff + 16:eoff + 24], "little")
-        payload = raw[off:off + size]
+        sid = int.from_bytes(raw[eoff : eoff + 4], "little")
+        enc = int.from_bytes(raw[eoff + 4 : eoff + 8], "little")
+        off = int.from_bytes(raw[eoff + 8 : eoff + 16], "little")
+        size = int.from_bytes(raw[eoff + 16 : eoff + 24], "little")
+        payload = raw[off : off + size]
         if enc != 0:
             raise SystemExit(f"baseline must be raw-encoded; section 0x{sid:02x} encoding={enc}")
         if sid == 0x04:
@@ -80,45 +82,58 @@ def _decode_baseline(path: Path):
 
     # Decode embeddings: f32 LE, n*dim
     import struct
+
     embs = list(struct.iter_unpack("<f", embeddings_payload))
     embs = [e[0] for e in embs]
 
     # Decode canonical texts: u32 version | u64 count | (u32 len, bytes)*
     def _decode_strings(buf, expected):
         pos = 0
-        ver = struct.unpack_from("<I", buf, pos)[0]; pos += 4
-        cnt = struct.unpack_from("<Q", buf, pos)[0]; pos += 8
+        ver = struct.unpack_from("<I", buf, pos)[0]
+        pos += 4
+        cnt = struct.unpack_from("<Q", buf, pos)[0]
+        pos += 8
         assert ver == 1 and cnt == expected, (ver, cnt, expected)
         out = []
         for _ in range(cnt):
-            slen = struct.unpack_from("<I", buf, pos)[0]; pos += 4
-            out.append(buf[pos:pos + slen].decode("utf-8")); pos += slen
+            slen = struct.unpack_from("<I", buf, pos)[0]
+            pos += 4
+            out.append(buf[pos : pos + slen].decode("utf-8"))
+            pos += slen
         return out
 
     texts = _decode_strings(canonical_payload, n)
 
     # Decode spans: prefix + (u32 len, bytes uri, u64 start, u64 end)*
     pos = 0
-    ver = struct.unpack_from("<I", spans_payload, pos)[0]; pos += 4
-    cnt = struct.unpack_from("<Q", spans_payload, pos)[0]; pos += 8
+    ver = struct.unpack_from("<I", spans_payload, pos)[0]
+    pos += 4
+    cnt = struct.unpack_from("<Q", spans_payload, pos)[0]
+    pos += 8
     assert ver == 1 and cnt == n
     spans = []
     for _ in range(n):
-        slen = struct.unpack_from("<I", spans_payload, pos)[0]; pos += 4
-        uri = spans_payload[pos:pos + slen].decode("utf-8"); pos += slen
-        start = struct.unpack_from("<Q", spans_payload, pos)[0]; pos += 8
-        end = struct.unpack_from("<Q", spans_payload, pos)[0]; pos += 8
+        slen = struct.unpack_from("<I", spans_payload, pos)[0]
+        pos += 4
+        uri = spans_payload[pos : pos + slen].decode("utf-8")
+        pos += slen
+        start = struct.unpack_from("<Q", spans_payload, pos)[0]
+        pos += 8
+        end = struct.unpack_from("<Q", spans_payload, pos)[0]
+        pos += 8
         spans.append((uri, start, end))
 
     chunks = []
     for i in range(n):
-        chunks.append(dict(
-            canonical_text=texts[i],
-            source_uri=spans[i][0],
-            byte_start=spans[i][1],
-            byte_end=spans[i][2],
-            embedding=embs[i * dim:(i + 1) * dim],
-        ))
+        chunks.append(
+            dict(
+                canonical_text=texts[i],
+                source_uri=spans[i][0],
+                byte_start=spans[i][1],
+                byte_end=spans[i][2],
+                embedding=embs[i * dim : (i + 1) * dim],
+            )
+        )
     meta = dict(
         embedding_model=info["manifest"]["embedding_model"],
         embedding_dim=dim,
@@ -180,6 +195,11 @@ def main():
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--variants", default="compressed,tiny,hybrid")
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit results as JSON to stdout (table to stderr) for regression gates.",
+    )
     args = ap.parse_args()
 
     base_path = Path(args.baseline)
@@ -217,32 +237,73 @@ def main():
     t_exact, hits_exact = _bench(db_exact, queries, args.k, mode="exact")
     base_top_score = [h[0].score for h in hits_exact]
 
-    print()
-    print(f"## Acceptance harness: {n} chunks, dim={dim}, {args.n_queries} queries, k={args.k}")
-    print(f"baseline:           {base_path}")
-    print(f"baseline file_hash: {db_exact.file_hash}")
-    print(f"baseline simd:      {db_exact.simd_backend}")
-    print()
+    log = sys.stderr if args.json else sys.stdout
+    print(file=log)
+    print(
+        f"## Acceptance harness: {n} chunks, dim={dim}, {args.n_queries} queries, k={args.k}",
+        file=log,
+    )
+    print(f"baseline:           {base_path}", file=log)
+    print(f"baseline file_hash: {db_exact.file_hash}", file=log)
+    print(f"baseline simd:      {db_exact.simd_backend}", file=log)
+    print(file=log)
     rows = []
-    rows.append(("preset", "size_MB", "size_ratio", "build_s", "recall@k",
-                 "drift_max", "drift_mean", "p50_ms", "p95_ms", "p99_ms"))
-    rows.append(("exact (baseline)",
-                 f"{base_size/1e6:.2f}",
-                 "1.000",
-                 "—",
-                 "1.0000",
-                 "0.000000",
-                 "0.000000",
-                 f"{_percentile(t_exact, 0.50):.3f}",
-                 f"{_percentile(t_exact, 0.95):.3f}",
-                 f"{_percentile(t_exact, 0.99):.3f}"))
+    rows.append(
+        (
+            "preset",
+            "size_MB",
+            "size_ratio",
+            "build_s",
+            "recall@k",
+            "drift_max",
+            "drift_mean",
+            "p50_ms",
+            "p95_ms",
+            "p99_ms",
+        )
+    )
+    rows.append(
+        (
+            "exact (baseline)",
+            f"{base_size / 1e6:.2f}",
+            "1.000",
+            "—",
+            "1.0000",
+            "0.000000",
+            "0.000000",
+            f"{_percentile(t_exact, 0.50):.3f}",
+            f"{_percentile(t_exact, 0.95):.3f}",
+            f"{_percentile(t_exact, 0.99):.3f}",
+        )
+    )
+    measurements = [
+        {
+            "preset": "exact",
+            "is_baseline": True,
+            "size_mb": round(base_size / 1e6, 4),
+            "size_ratio": 1.0,
+            "build_s": None,
+            "recall_at_k": 1.0,
+            "drift_max": 0.0,
+            "drift_mean": 0.0,
+            "p50_ms": round(_percentile(t_exact, 0.50), 4),
+            "p95_ms": round(_percentile(t_exact, 0.95), 4),
+            "p99_ms": round(_percentile(t_exact, 0.99), 4),
+            "dtype": db_exact.dtype,
+            "has_ann": db_exact.has_ann,
+            "has_bm25": db_exact.has_bm25,
+            "search_mode": "exact",
+            "file_hash": db_exact.file_hash,
+            "content_hash": db_exact.content_hash,
+        }
+    ]
 
     for preset in args.variants.split(","):
         preset = preset.strip()
         if not preset:
             continue
         out_path = OUT_DIR / f"corpus_{preset}.nest"
-        print(f"\n→ building preset={preset} → {out_path}")
+        print(f"\n→ building preset={preset} → {out_path}", file=log)
         build_time = _build_variant(chunks, meta, preset, out_path)
         size = out_path.stat().st_size
         size_ratio = size / base_size
@@ -258,16 +319,19 @@ def main():
             mode = "ann"
         else:
             mode = "exact"
-        print(f"  size={size/1e6:.2f} MB ({size_ratio:.3f}× baseline)  "
-              f"dtype={db_v.dtype}  has_ann={db_v.has_ann}  has_bm25={db_v.has_bm25}  "
-              f"search_mode={mode}  build={build_time:.1f}s")
+        print(
+            f"  size={size / 1e6:.2f} MB ({size_ratio:.3f}× baseline)  "
+            f"dtype={db_v.dtype}  has_ann={db_v.has_ann}  has_bm25={db_v.has_bm25}  "
+            f"search_mode={mode}  build={build_time:.1f}s",
+            file=log,
+        )
 
         t_v, hits_v = _bench(db_v, queries, args.k, mode=mode)
 
         # Recall@k against exact baseline.
         recalls = []
         drifts = []
-        for h_exact, h_v, base_score in zip(hits_exact, hits_v, base_top_score):
+        for h_exact, h_v, base_score in zip(hits_exact, hits_v, base_top_score, strict=False):
             ex_ids = {h.chunk_id for h in h_exact}
             v_ids = {h.chunk_id for h in h_v}
             recalls.append(len(ex_ids & v_ids) / args.k)
@@ -277,28 +341,68 @@ def main():
         drift_max = max(drifts) if drifts else 0.0
         drift_mean = mean(drifts) if drifts else 0.0
 
-        rows.append((
-            preset,
-            f"{size/1e6:.2f}",
-            f"{size_ratio:.3f}",
-            f"{build_time:.1f}",
-            f"{recall:.4f}",
-            f"{drift_max:.6f}",
-            f"{drift_mean:.6f}",
-            f"{_percentile(t_v, 0.50):.3f}",
-            f"{_percentile(t_v, 0.95):.3f}",
-            f"{_percentile(t_v, 0.99):.3f}",
-        ))
+        rows.append(
+            (
+                preset,
+                f"{size / 1e6:.2f}",
+                f"{size_ratio:.3f}",
+                f"{build_time:.1f}",
+                f"{recall:.4f}",
+                f"{drift_max:.6f}",
+                f"{drift_mean:.6f}",
+                f"{_percentile(t_v, 0.50):.3f}",
+                f"{_percentile(t_v, 0.95):.3f}",
+                f"{_percentile(t_v, 0.99):.3f}",
+            )
+        )
+        measurements.append(
+            {
+                "preset": preset,
+                "is_baseline": False,
+                "size_mb": round(size / 1e6, 4),
+                "size_ratio": round(size_ratio, 4),
+                "build_s": round(build_time, 2),
+                "recall_at_k": round(recall, 4),
+                "drift_max": round(drift_max, 6),
+                "drift_mean": round(drift_mean, 6),
+                "p50_ms": round(_percentile(t_v, 0.50), 4),
+                "p95_ms": round(_percentile(t_v, 0.95), 4),
+                "p99_ms": round(_percentile(t_v, 0.99), 4),
+                "dtype": db_v.dtype,
+                "has_ann": db_v.has_ann,
+                "has_bm25": db_v.has_bm25,
+                "search_mode": mode,
+                "file_hash": db_v.file_hash,
+                "content_hash": db_v.content_hash,
+            }
+        )
 
-    print()
-    print("## Results")
+    print(file=log)
+    print("## Results", file=log)
     widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
     sep = "  ".join("-" * w for w in widths)
     for i, row in enumerate(rows):
-        line = "  ".join(str(c).ljust(w) for c, w in zip(row, widths))
-        print(line)
+        line = "  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=False))
+        print(line, file=log)
         if i == 0:
-            print(sep)
+            print(sep, file=log)
+
+    if args.json:
+        doc = {
+            "schema_version": 1,
+            "n_chunks": n,
+            "embedding_dim": dim,
+            "n_queries": args.n_queries,
+            "k": args.k,
+            "seed": args.seed,
+            "baseline_path": str(base_path),
+            "baseline_file_hash": db_exact.file_hash,
+            "baseline_content_hash": db_exact.content_hash,
+            "simd_backend": db_exact.simd_backend,
+            "presets": measurements,
+        }
+        json.dump(doc, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
 
 
 if __name__ == "__main__":

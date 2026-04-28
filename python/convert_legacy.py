@@ -12,13 +12,14 @@ New v1 .nest:
   - synthetic source_uri = `legacy://truw_ptbr/<id>`, byte span = [0, len(utf8(text))]
   - provenance carries the legacy labels/sources so nothing is lost
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import struct
 import sqlite3
+import struct
 import sys
 import time
 
@@ -27,14 +28,18 @@ import zstandard as zstd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nest
+from model_fingerprint import (
+    PLACEHOLDER_HASH,
+    compute_model_fingerprint,
+    fingerprint_to_model_hash,
+    resolve_model_dir,
+)
 
 
 def load_blocks(conn: sqlite3.Connection):
     """Yield (block_id, [text, ...]) for every text_block, in block_id order."""
     dec = zstd.ZstdDecompressor()
-    for block_id, data in conn.execute(
-        "SELECT block_id, data FROM text_blocks ORDER BY block_id"
-    ):
+    for block_id, data in conn.execute("SELECT block_id, data FROM text_blocks ORDER BY block_id"):
         raw = dec.decompress(data)
         n = struct.unpack_from("<I", raw, 0)[0]
         offsets = struct.unpack_from(f"<{n}I", raw, 4)
@@ -90,11 +95,7 @@ def convert(src: str, dst: str, *, reproducible: bool) -> None:
         raise SystemExit(f"{len(missing)} articles have no text (e.g. id={missing[:5]})")
 
     # Per-article metadata.
-    rows = list(
-        conn.execute(
-            "SELECT id, source, label FROM articles ORDER BY id"
-        )
-    )
+    rows = list(conn.execute("SELECT id, source, label FROM articles ORDER BY id"))
     if len(rows) != n:
         raise SystemExit(f"articles table has {len(rows)} rows but manifest says {n}")
 
@@ -126,13 +127,27 @@ def convert(src: str, dst: str, *, reproducible: bool) -> None:
         "legacy_created": legacy_manifest.get("created"),
         "labels": labels,
         "sources": sources,
-        "note": "synthetic source_uri = legacy://truw_ptbr/<id> since the legacy format did not preserve original URIs",
+        "note": (
+            "synthetic source_uri = legacy://truw_ptbr/<id> since the legacy "
+            "format did not preserve original URIs"
+        ),
     }
 
-    # The legacy embedding model (paraphrase-multilingual-MiniLM-L12-v2) doesn't
-    # ship with a stable reproducible hash here, so we tag it as a placeholder
-    # zero-hash. Callers that need a verified model_hash can override.
-    model_hash = "sha256:" + "0" * 64
+    # Resolve the model snapshot and compute a real fingerprint. We
+    # require the snapshot to be locally available — if it isn't, the
+    # caller can re-download it via `python -c "from sentence_transformers
+    # import SentenceTransformer; SentenceTransformer('<id>')"`. The
+    # placeholder zero-hash is no longer accepted by the manifest.
+    model_dir = resolve_model_dir(model)
+    fp = compute_model_fingerprint(model_dir, model_id=model)
+    model_hash = fingerprint_to_model_hash(fp)
+    if model_hash == PLACEHOLDER_HASH:
+        raise SystemExit(
+            f"refusing to write placeholder model_hash for model={model}; "
+            f"snapshot at {model_dir} appears to be missing relevant files"
+        )
+    print(f"computed model_hash: {model_hash}")
+    print(f"  fingerprint: {fp.to_dict()}")
 
     if os.path.exists(dst):
         os.unlink(dst)
@@ -152,7 +167,7 @@ def convert(src: str, dst: str, *, reproducible: bool) -> None:
     )
     elapsed = time.time() - t0
     size = os.path.getsize(dst)
-    print(f"wrote {dst}: {size/1e6:.2f} MB in {elapsed:.1f}s")
+    print(f"wrote {dst}: {size / 1e6:.2f} MB in {elapsed:.1f}s")
 
     # Final integrity check through the same Rust reader the runtime uses.
     db = nest.open(dst)
