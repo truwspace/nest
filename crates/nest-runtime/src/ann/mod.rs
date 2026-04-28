@@ -44,8 +44,11 @@ pub const HNSW_PAYLOAD_VERSION: u32 = 1;
 /// flat enough that the default is fine.
 pub const DEFAULT_M: usize = 16;
 /// Default candidate-list size during construction. Larger = better
-/// recall, slower build.
-pub const DEFAULT_EF_CONSTRUCTION: usize = 200;
+/// recall, slower build. 400 is our chosen production default —
+/// empirically gives recall@10 ≥ 0.95 at typical corpus sizes
+/// (n ≤ 100k, dim ≤ 768) when paired with `ef_search ≥ 400`. Lower
+/// values save build time but require larger `ef_search` to match.
+pub const DEFAULT_EF_CONSTRUCTION: usize = 400;
 
 #[derive(Clone, Debug)]
 pub(super) struct Node {

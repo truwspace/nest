@@ -46,7 +46,7 @@ def _decode_baseline(path: Path):
     info = db.inspect()
     n = db.n_embeddings
     dim = db.embedding_dim
-    print(f"baseline: {path}  n={n} dim={dim} dtype={db.dtype}")
+    print(f"baseline: {path}  n={n} dim={dim} dtype={db.dtype}", file=sys.stderr)
 
     # Re-derive embeddings: easier to query the unit-vector basis we want
     # via search? No — we need the actual stored vectors. Easiest path:

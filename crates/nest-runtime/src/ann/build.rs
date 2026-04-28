@@ -1,15 +1,13 @@
 //! HNSW construction: insert nodes one at a time, link bidirectionally,
-//! and (Phase 2) call the heuristic neighbor selector. Today the simple
-//! top-m selector is wired in; the heuristic variant is one call-site swap
-//! away in `select_neighbors::select_neighbors_simple`.
-//!
-//! Build is deterministic given the same seed: level distribution comes
-//! from a fixed LCG, neighbor lists are sorted by id when serialized.
+//! and call `select_neighbors_heuristic` (Algorithm 4) at every neighbor
+//! selection point. Build is deterministic given the same seed: level
+//! distribution comes from a fixed LCG, neighbor lists are sorted by id
+//! when serialized.
 
 use nest_format::Int8EmbeddingsView;
 
 use super::search::{greedy_search, layer_search};
-use super::select_neighbors::select_neighbors_simple;
+use super::select_neighbors::select_neighbors_heuristic;
 use super::{Candidate, HnswIndex, Node, cosine_dist};
 
 impl HnswIndex {
@@ -74,20 +72,25 @@ impl HnswIndex {
                     dim,
                     i as u32,
                 );
-                let m_layer = if layer == 0 { m_max0 } else { m };
-                let neighbor_ids = select_neighbors_simple(&candidates, m_layer);
+                // The new node always picks `m` neighbors (Algorithm 4 with
+                // M=m). The asymmetry — layer 0 allowing up to `m_max0`
+                // neighbors per node — only kicks in via backlinks: when
+                // neighbor's list overflows `cap_layer`, we re-select with
+                // the heuristic to bring it back down to `cap_layer`.
+                let cap_layer = if layer == 0 { m_max0 } else { m };
+                let neighbor_ids = select_neighbors_heuristic(&candidates, m, &vectors, dim, true);
                 nodes[i].neighbors[layer as usize] = neighbor_ids.clone();
 
                 // Backlinks. Insert i into each neighbor's list and prune
-                // if it overflows m_layer.
+                // if it overflows `cap_layer`.
                 for &nbr in &neighbor_ids {
                     let nbr_idx = nbr as usize;
                     let layer_idx = layer as usize;
                     if layer_idx >= nodes[nbr_idx].neighbors.len() {
                         continue;
                     }
-                    if nodes[nbr_idx].neighbors[layer_idx].len() >= m_layer {
-                        // Prune: keep the m_layer closest of (existing + i).
+                    if nodes[nbr_idx].neighbors[layer_idx].len() >= cap_layer {
+                        // Prune: keep the cap_layer best of (existing + i).
                         let mut all: Vec<Candidate> = nodes[nbr_idx].neighbors[layer_idx]
                             .iter()
                             .map(|&id| Candidate {
@@ -106,13 +109,18 @@ impl HnswIndex {
                             ),
                         });
                         nodes[nbr_idx].neighbors[layer_idx] =
-                            select_neighbors_simple(&all, m_layer);
+                            select_neighbors_heuristic(&all, cap_layer, &vectors, dim, true);
                     } else if !nodes[nbr_idx].neighbors[layer_idx].contains(&(i as u32)) {
                         nodes[nbr_idx].neighbors[layer_idx].push(i as u32);
                     }
                 }
 
-                if !candidates.is_empty() {
+                // Next-layer entry is the closest *selected* neighbor (post-
+                // heuristic). hnswlib does the same. Falls back to the raw
+                // beam closest if the heuristic returned nothing.
+                if let Some(&first) = neighbor_ids.first() {
+                    entry = first;
+                } else if !candidates.is_empty() {
                     entry = candidates[0].id;
                 }
             }

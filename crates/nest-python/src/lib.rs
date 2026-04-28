@@ -212,7 +212,7 @@ impl From<nest_runtime::SearchHit> for SearchHitPy {
     with_hnsw=None,
     with_bm25=None,
     hnsw_m=16,
-    hnsw_ef_construction=200,
+    hnsw_ef_construction=400,
     hnsw_seed=42,
 ))]
 #[allow(clippy::too_many_arguments)]

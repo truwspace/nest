@@ -161,7 +161,7 @@ class BuildConfig:
     with_hnsw: bool | None = None
     with_bm25: bool | None = None
     hnsw_m: int = 16
-    hnsw_ef_construction: int = 200
+    hnsw_ef_construction: int = 400
     hnsw_seed: int = 42
 
 
