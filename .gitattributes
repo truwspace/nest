@@ -1,1 +1,8 @@
+*.npy filter=lfs diff=lfs merge=lfs -text
+*.xlsx filter=lfs diff=lfs merge=lfs -text
+*.csv filter=lfs diff=lfs merge=lfs -text
+*.sqlite filter=lfs diff=lfs merge=lfs -text
+*.nest filter=lfs diff=lfs merge=lfs -text
+*.nest-* filter=lfs diff=lfs merge=lfs -text
+*.parquet filter=lfs diff=lfs merge=lfs -text
 data/corpus_next.v1.nest filter=lfs diff=lfs merge=lfs -text

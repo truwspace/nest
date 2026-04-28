@@ -35,8 +35,7 @@ Thumbs.db
 *~
 
 # Project specific
-/database
-
+# database/ and data/*.nest are tracked via Git LFS (see .gitattributes)
 
 kdb/
 adr/
