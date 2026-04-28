@@ -1,4 +1,3 @@
-Não escreva markdowns, memórias ou arquivos de documentação NÃO SOLICITADOS.
 
 # Build & Test
 
