@@ -1,10 +1,17 @@
-//! `nest benchmark <file> -q N -k K [--ann EF]` — latency stats over
-//! random queries, with optional ANN comparison + recall@k vs exact.
+//! `nest benchmark <file> -q N -k K [--ann EF] [--madvise-cold]` —
+//! latency stats over random queries, with optional ANN comparison +
+//! recall@k vs exact, plus an opt-in madvise-cold pass.
 
 use anyhow::Result;
 use std::path::PathBuf;
 
-pub fn run(file: PathBuf, n_queries: usize, k: i32, ann_ef: Option<usize>) -> Result<()> {
+pub fn run(
+    file: PathBuf,
+    n_queries: usize,
+    k: i32,
+    ann_ef: Option<usize>,
+    madvise_cold: bool,
+) -> Result<()> {
     let runtime = nest_runtime::MmapNestFile::open(&file)?;
     let dim = runtime.embedding_dim();
 
@@ -20,24 +27,41 @@ pub fn run(file: PathBuf, n_queries: usize, k: i32, ann_ef: Option<usize>) -> Re
         queries.push(q);
     }
 
-    let exact_times = run_bench(&runtime, &queries, |rt, q| rt.search(q, k))?;
-    println!(
-        "Exact ({} queries, dim={}, dtype={}, simd={}):",
+    let header = format!(
+        "Exact ({} queries, dim={}, dtype={}, simd={})",
         n_queries,
         dim,
         runtime.dtype().name(),
         runtime.simd_backend().name()
     );
+    let exact_times = run_bench(&runtime, &queries, false, |rt, q| rt.search(q, k))?;
+    println!("{} [hot]:", header);
     print_latency(&exact_times);
+
+    if madvise_cold {
+        let cold_times = run_bench(&runtime, &queries, true, |rt, q| rt.search(q, k))?;
+        println!("{} [madvise-cold]:", header);
+        print_latency(&cold_times);
+        println!(
+            "  (note: posix_madvise(MADV_DONTNEED) is a hint, not a guarantee. \
+             Treat as an upper bound on cold-cache latency, not absolute cold.)"
+        );
+    }
 
     if let Some(ef) = ann_ef {
         if !runtime.has_ann() {
             println!("(no HNSW section — ANN bench skipped)");
             return Ok(());
         }
-        let ann_times = run_bench(&runtime, &queries, |rt, q| rt.search_ann(q, k, ef))?;
-        println!("ANN ef={} ({} queries):", ef, n_queries);
+        let ann_times = run_bench(&runtime, &queries, false, |rt, q| rt.search_ann(q, k, ef))?;
+        println!("ANN ef={} ({} queries) [hot]:", ef, n_queries);
         print_latency(&ann_times);
+
+        if madvise_cold {
+            let cold = run_bench(&runtime, &queries, true, |rt, q| rt.search_ann(q, k, ef))?;
+            println!("ANN ef={} ({} queries) [madvise-cold]:", ef, n_queries);
+            print_latency(&cold);
+        }
 
         // Recall@k of ANN vs exact, computed on the same queries.
         let mut hits_overlap_total = 0.0f64;
@@ -65,6 +89,7 @@ pub fn run(file: PathBuf, n_queries: usize, k: i32, ann_ef: Option<usize>) -> Re
 fn run_bench(
     rt: &nest_runtime::MmapNestFile,
     queries: &[Vec<f32>],
+    madvise_cold: bool,
     mut f: impl FnMut(
         &nest_runtime::MmapNestFile,
         &[f32],
@@ -72,6 +97,9 @@ fn run_bench(
 ) -> Result<Vec<f64>> {
     let mut times = Vec::with_capacity(queries.len());
     for q in queries {
+        if madvise_cold {
+            rt.madvise_cold();
+        }
         let t0 = std::time::Instant::now();
         f(rt, q)?;
         times.push(t0.elapsed().as_secs_f64() * 1000.0);

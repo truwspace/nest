@@ -15,7 +15,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Inspect file metadata, manifest, and section table.
-    Inspect { file: PathBuf },
+    Inspect {
+        file: PathBuf,
+        /// Emit as JSON instead of the human-readable layout. Schema:
+        /// `{magic, version_major, version_minor, format_version,
+        /// schema_version, embedding_dim, n_chunks, n_embeddings,
+        /// file_size, manifest, sections[], file_hash, content_hash,
+        /// simd_backend}`.
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate file integrity (magic, checksums, hashes, manifest, contract).
     Validate { file: PathBuf },
     /// Search a `.nest` file with a JSON-array query vector (exact path).
@@ -78,6 +87,12 @@ enum Commands {
         /// If set, also benchmark `search_ann` with the given ef.
         #[arg(long)]
         ann: Option<usize>,
+        /// Force a "madvise-cold" cache between queries by calling
+        /// posix_madvise(MADV_DONTNEED) on the mmap. Approximates the
+        /// first hit pos-boot — but it's a hint, not a guarantee.
+        /// See MmapNestFile::madvise_cold for caveats.
+        #[arg(long)]
+        madvise_cold: bool,
     },
     /// Show file stats.
     Stats { file: PathBuf },
@@ -93,7 +108,7 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Inspect { file } => cmd::inspect::run(file),
+        Commands::Inspect { file, json } => cmd::inspect::run(file, json),
         Commands::Validate { file } => cmd::validate::run(file),
         Commands::Search { file, query, k } => cmd::search::run(file, query, k),
         Commands::SearchText {
@@ -119,7 +134,8 @@ fn main() -> Result<()> {
             queries,
             k,
             ann,
-        } => cmd::benchmark::run(file, queries, k, ann),
+            madvise_cold,
+        } => cmd::benchmark::run(file, queries, k, ann, madvise_cold),
         Commands::Stats { file } => cmd::stats::run(file),
         Commands::Cite { file, citation } => cmd::cite::run(file, citation),
     }

@@ -1,11 +1,16 @@
-//! `nest inspect <file>` — header, section table, manifest, hashes.
+//! `nest inspect <file> [--json]` — header, section table, manifest,
+//! hashes. JSON variant mirrors `MmapNestFile::inspect_json` for
+//! programmatic consumers.
 
 use anyhow::Result;
 use std::path::PathBuf;
 
 use super::util::encoding_name;
 
-pub fn run(file: PathBuf) -> Result<()> {
+pub fn run(file: PathBuf, json: bool) -> Result<()> {
+    if json {
+        return run_json(file);
+    }
     let data = std::fs::read(&file)?;
     let view = nest_format::NestView::from_bytes(&data)?;
     let magic = std::str::from_utf8(&view.header.magic).unwrap_or("???");
@@ -35,5 +40,16 @@ pub fn run(file: PathBuf) -> Result<()> {
     );
     println!("File hash:    {}", view.file_hash_hex());
     println!("Content hash: {}", view.content_hash_hex()?);
+    Ok(())
+}
+
+fn run_json(file: PathBuf) -> Result<()> {
+    // Reuse the runtime's inspect_json; same schema as
+    // `NestFile.inspect()` from Python and the PyO3 bindings.
+    let rt = nest_runtime::MmapNestFile::open(&file)?;
+    let s = rt.inspect_json()?;
+    // Pretty-print so humans can read it too without a separate tool.
+    let v: serde_json::Value = serde_json::from_str(&s)?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
 }
