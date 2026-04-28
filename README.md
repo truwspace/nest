@@ -2,7 +2,7 @@ nest
 
 portable binary format for distributing semantic knowledge bases. one file carries chunks, embeddings, source spans and a search contract, all hash-verified and memory-mapped.
 
-built by truw to run 100 percent local, no server, with cryptographic integrity and traceable citation.
+built by truw to run 100% localfirst, no server, with cryptographic integrity and traceable citation.
 
 python builds. rust serves. nest ships. agents read.
 
@@ -60,13 +60,16 @@ nest.build(
 
 or via Pipeline in python/builder.py with chunker, SQLite cache and auto-validate.
 
-v1 contract
+v1:
 
 flat exact search. real cosine score. recall 1.0. L2-normalized float32 embeddings. six required sections, 64-byte aligned, all checksummed. file_hash over the whole file, content_hash over the canonical sections, stable across rebuilds.
 
 builds with reproducible=True are byte-identical for the same input.
 
 tests
+
+v2 wip:
+
 
 ```
 cargo test --workspace
