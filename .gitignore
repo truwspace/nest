@@ -16,6 +16,7 @@ build/
 wheels/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 .python-version
 
 # Virtual environments
@@ -44,8 +45,11 @@ Thumbs.db
 data/measure/corpus_*.nest
 data/measure/*.nest-*
 
-kdb/
-adr/
-# Documentation not requested
+# kdb/ holds the project's knowledge base — ADRs, design notes.
+# Tracked. Earlier sessions had it gitignored, which silently dropped
+# every architectural decision committed there. Fixed 2026-04-28.
+
+# CODE_OF_CONDUCT.md / CONTRIBUTING.md are still empty templates from
+# the upstream init; tracking them as-is would publish placeholders.
 CODE_OF_CONDUCT.md
 CONTRIBUTING.md
