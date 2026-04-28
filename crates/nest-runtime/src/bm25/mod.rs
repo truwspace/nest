@@ -37,4 +37,5 @@ mod tests;
 
 pub use fusion::rrf_union;
 pub use index::{BM25_PAYLOAD_VERSION, Bm25Index, DEFAULT_B, DEFAULT_K1};
+#[cfg(test)]
 pub(crate) use tokenize::tokenize;

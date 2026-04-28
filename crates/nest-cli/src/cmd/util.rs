@@ -1,0 +1,65 @@
+//! Shared CLI helpers: pretty-printers and embedder discovery.
+
+use std::path::PathBuf;
+
+pub fn print_result(result: &nest_runtime::SearchResult) {
+    println!("index_type:   {}", result.index_type);
+    if !result.recall.is_nan() {
+        println!("recall:       {}", result.recall);
+    } else {
+        println!("recall:       (not computed; rerank guarantees real cosine)");
+    }
+    println!("truncated:    {}", result.truncated);
+    println!("k_requested:  {}", result.k_requested);
+    println!("k_returned:   {}", result.k_returned);
+    println!("query_time:   {:.3} ms", result.query_time_ms);
+    println!("hits:");
+    for (i, hit) in result.hits.iter().enumerate() {
+        println!(
+            "  [{:3}] chunk_id={} score={:.6} score_type={} source_uri={} \
+             offset={}-{} model={} index_type={} reranked={} file_hash={} \
+             content_hash={} citation_id={}",
+            i + 1,
+            hit.chunk_id,
+            hit.score,
+            hit.score_type,
+            hit.source_uri,
+            hit.offset_start,
+            hit.offset_end,
+            hit.embedding_model,
+            hit.index_type,
+            hit.reranked,
+            hit.file_hash,
+            hit.content_hash,
+            hit.citation_id,
+        );
+    }
+}
+
+pub fn encoding_name(e: u32) -> &'static str {
+    match e {
+        nest_format::layout::SECTION_ENCODING_RAW => "raw",
+        nest_format::layout::SECTION_ENCODING_ZSTD => "zstd",
+        nest_format::layout::SECTION_ENCODING_FLOAT16 => "float16",
+        nest_format::layout::SECTION_ENCODING_INT8 => "int8",
+        _ => "unknown",
+    }
+}
+
+/// Walk up from CARGO_MANIFEST_DIR / current dir to find python/embed_query.py.
+pub fn default_embedder_path() -> PathBuf {
+    let candidates = [
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("python").join("embed_query.py")),
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("..").join("python").join("embed_query.py")),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if c.exists() {
+            return c;
+        }
+    }
+    PathBuf::from("python/embed_query.py")
+}

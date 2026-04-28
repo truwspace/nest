@@ -103,8 +103,8 @@ impl Bm25Index {
             let Some(entry) = self.terms.get(&term) else {
                 continue;
             };
-            let idf = ((self.n_docs as f32 - entry.df as f32 + 0.5) / (entry.df as f32 + 0.5) + 1.0)
-                .ln();
+            let idf =
+                ((self.n_docs as f32 - entry.df as f32 + 0.5) / (entry.df as f32 + 0.5) + 1.0).ln();
             for p in &entry.postings {
                 let dl = self.doc_lengths[p.doc as usize] as f32;
                 let denom =

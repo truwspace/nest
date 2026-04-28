@@ -96,10 +96,8 @@ impl MmapNestFile {
 
         // Decoded chunk_ids / spans (handles zstd transparently).
         let chunk_ids = decode_chunk_ids(&view.decoded_section(SECTION_CHUNK_IDS)?, n)?;
-        let spans = decode_chunks_original_spans(
-            &view.decoded_section(SECTION_CHUNKS_ORIGINAL_SPANS)?,
-            n,
-        )?;
+        let spans =
+            decode_chunks_original_spans(&view.decoded_section(SECTION_CHUNKS_ORIGINAL_SPANS)?, n)?;
 
         // Optional ANN section. Materialize f32 vectors from the
         // embeddings section so the graph can compute distances at

@@ -1,0 +1,171 @@
+//! `NestFile` PyO3 class + `SearchHitPy` data type. Wraps
+//! `MmapNestFile` and exposes search/inspect/validate to Python.
+
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+
+#[pyclass]
+pub struct NestFile {
+    pub(super) rt: nest_runtime::MmapNestFile,
+}
+
+#[pymethods]
+impl NestFile {
+    #[staticmethod]
+    fn open(path: &str) -> PyResult<Self> {
+        let rt = nest_runtime::MmapNestFile::open(std::path::Path::new(path))
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        Ok(Self { rt })
+    }
+
+    fn search(&self, query: &Bound<PyAny>, k: i32) -> PyResult<Vec<SearchHitPy>> {
+        let qvec: Vec<f32> = query
+            .extract()
+            .map_err(|e| PyValueError::new_err(format!("invalid query vector: {}", e)))?;
+        let res = self
+            .rt
+            .search(&qvec, k)
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        Ok(res.hits.into_iter().map(SearchHitPy::from).collect())
+    }
+
+    /// HNSW ANN search with exact rerank. Falls back to `search()` if
+    /// the file has no HNSW section.
+    fn search_ann(&self, query: &Bound<PyAny>, k: i32, ef: usize) -> PyResult<Vec<SearchHitPy>> {
+        let qvec: Vec<f32> = query
+            .extract()
+            .map_err(|e| PyValueError::new_err(format!("invalid query vector: {}", e)))?;
+        let res = self
+            .rt
+            .search_ann(&qvec, k, ef)
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        Ok(res.hits.into_iter().map(SearchHitPy::from).collect())
+    }
+
+    /// Hybrid (BM25 ∪ vector → exact rerank). Falls back to `search()`
+    /// when no BM25 section is present.
+    fn search_hybrid(
+        &self,
+        query: &Bound<PyAny>,
+        query_text: &str,
+        k: i32,
+        candidates: usize,
+    ) -> PyResult<Vec<SearchHitPy>> {
+        let qvec: Vec<f32> = query
+            .extract()
+            .map_err(|e| PyValueError::new_err(format!("invalid query vector: {}", e)))?;
+        let res = self
+            .rt
+            .search_hybrid(&qvec, query_text, k, candidates)
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        Ok(res.hits.into_iter().map(SearchHitPy::from).collect())
+    }
+
+    #[getter]
+    fn embedding_dim(&self) -> usize {
+        self.rt.embedding_dim()
+    }
+
+    #[getter]
+    fn n_embeddings(&self) -> usize {
+        self.rt.n_embeddings()
+    }
+
+    #[getter]
+    fn dtype(&self) -> &'static str {
+        self.rt.dtype().name()
+    }
+
+    #[getter]
+    fn simd_backend(&self) -> &'static str {
+        self.rt.simd_backend().name()
+    }
+
+    #[getter]
+    fn has_ann(&self) -> bool {
+        self.rt.has_ann()
+    }
+
+    #[getter]
+    fn has_bm25(&self) -> bool {
+        self.rt.has_bm25()
+    }
+
+    #[getter]
+    fn file_hash(&self) -> String {
+        self.rt.file_hash().to_string()
+    }
+
+    #[getter]
+    fn content_hash(&self) -> String {
+        self.rt.content_hash().to_string()
+    }
+
+    /// Mirror of `nest inspect`: returns a Python dict with header,
+    /// section table, manifest and hashes.
+    fn inspect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let s = self
+            .rt
+            .inspect_json()
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        py.import("json")?.call_method1("loads", (s,))
+    }
+
+    /// Re-run reader-side validation. Returns `True` on success and
+    /// raises `ValueError` (with the reader's typed error in the
+    /// message) on any failure.
+    fn validate(&self) -> PyResult<bool> {
+        self.rt
+            .revalidate()
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        Ok(true)
+    }
+}
+
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct SearchHitPy {
+    #[pyo3(get)]
+    pub chunk_id: String,
+    #[pyo3(get)]
+    pub score: f32,
+    #[pyo3(get)]
+    pub score_type: String,
+    #[pyo3(get)]
+    pub source_uri: String,
+    #[pyo3(get)]
+    pub offset_start: u64,
+    #[pyo3(get)]
+    pub offset_end: u64,
+    #[pyo3(get)]
+    pub embedding_model: String,
+    #[pyo3(get)]
+    pub index_type: String,
+    #[pyo3(get)]
+    pub reranked: bool,
+    #[pyo3(get)]
+    pub file_hash: String,
+    #[pyo3(get)]
+    pub content_hash: String,
+    #[pyo3(get)]
+    pub citation_id: String,
+}
+
+impl From<nest_runtime::SearchHit> for SearchHitPy {
+    fn from(h: nest_runtime::SearchHit) -> Self {
+        Self {
+            chunk_id: h.chunk_id,
+            score: h.score,
+            score_type: h.score_type.to_string(),
+            source_uri: h.source_uri,
+            offset_start: h.offset_start,
+            offset_end: h.offset_end,
+            embedding_model: h.embedding_model,
+            index_type: h.index_type.to_string(),
+            reranked: h.reranked,
+            file_hash: h.file_hash,
+            content_hash: h.content_hash,
+            citation_id: h.citation_id,
+        }
+    }
+}
