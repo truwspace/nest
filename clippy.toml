@@ -1,0 +1,35 @@
+# Clippy configuration. Pinning explicit thresholds so a clippy release
+# that bumps a default can't silently flag (or unflag) code in this
+# workspace. Run via:
+#
+#   cargo clippy --workspace --all-targets -- -D warnings
+#
+# The `-D warnings` flag is what release_check.sh enforces — every
+# clippy lint is treated as a hard error. New lints from clippy
+# upgrades will block the gate until reviewed.
+
+# Minimum supported Rust version. Set to whatever rustc the workspace
+# Cargo.toml declares (edition 2024 needs ≥ 1.85). Bump in lock-step
+# with the toolchain.
+msrv = "1.85"
+
+# Cognitive complexity: clippy default is 25; the 12-file Phase 5
+# refactor proved the codebase fits in ≤ 15 per function with the
+# 300-line file rule. Tighter than the default; lets long functions
+# trip earlier than line count alone would.
+cognitive-complexity-threshold = 15
+
+# Type complexity: dynamic threshold vs concrete count. clippy default
+# is 250; we override down because the format crate uses a few
+# Cow-of-Vec-of-tuple types that test the limit without being unwieldy.
+type-complexity-threshold = 250
+
+# `too_many_arguments` threshold. Default is 7; runtime crate has a
+# legitimate 8-arg recall harness (n + dim + queries + n_q + k + ef +
+# corpus + idx). Tag those with #[allow(clippy::too_many_arguments)]
+# at the call site rather than raising the threshold globally.
+too-many-arguments-threshold = 7
+
+# Doc-attribute lints are noisy on a project with cross-crate links;
+# leave the rustdoc gate to rustdoc itself.
+allow-print-in-tests = true
