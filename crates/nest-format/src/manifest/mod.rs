@@ -1,26 +1,19 @@
-use crate::error::NestError;
+//! Manifest types and constants. The `validate` impl lives in
+//! `manifest::validate`; the canonical-JSON serializer in
+//! `manifest::canonical`. This module owns the data shape only.
+
+mod canonical;
+mod validate;
+
+pub use validate::{
+    ALLOWED_DTYPES, ALLOWED_INDEX_TYPES, ALLOWED_RERANK_POLICIES, ALLOWED_SCORE_TYPES,
+    SUPPORTED_DTYPE, SUPPORTED_INDEX_TYPE, SUPPORTED_METRIC, SUPPORTED_NORMALIZE,
+    SUPPORTED_RERANK_POLICY, SUPPORTED_SCORE_TYPE,
+};
+
 use crate::layout::{NEST_FORMAT_VERSION, NEST_SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-
-/// Default embedding dtype; v1.0 ships float32 as the recall-max baseline.
-/// Compressed/quantized presets declare `dtype = "float16"` or `"int8"`.
-pub const SUPPORTED_DTYPE: &str = "float32";
-pub const SUPPORTED_METRIC: &str = "ip";
-pub const SUPPORTED_SCORE_TYPE: &str = "cosine";
-pub const SUPPORTED_NORMALIZE: &str = "l2";
-pub const SUPPORTED_INDEX_TYPE: &str = "exact";
-pub const SUPPORTED_RERANK_POLICY: &str = "none";
-
-/// Every dtype the reader understands for the embeddings section.
-pub const ALLOWED_DTYPES: &[&str] = &["float32", "float16", "int8"];
-/// Every index_type the reader understands for the search path.
-pub const ALLOWED_INDEX_TYPES: &[&str] = &["exact", "hnsw", "hybrid"];
-/// Every rerank policy the reader understands. `exact` means an ANN/BM25
-/// candidate set is rescored with real cosine before returning.
-pub const ALLOWED_RERANK_POLICIES: &[&str] = &["none", "exact"];
-/// Every score_type the reader understands.
-pub const ALLOWED_SCORE_TYPES: &[&str] = &["cosine", "hybrid_rrf"];
 
 /// Capabilities advertised by a .nest file. v1 only requires `supports_exact`
 /// and `supports_reproducible_build` to be true; the rest are forward-looking
@@ -112,129 +105,12 @@ impl Default for Manifest {
     }
 }
 
-impl Manifest {
-    /// Validate that this manifest matches the v1 contract. Reject any
-    /// unsupported value with a typed error rather than a string blob.
-    ///
-    /// Version skew policy:
-    ///   - `format_version` > reader's supported version → reject (the
-    ///     binary container may have changed in incompatible ways).
-    ///   - `schema_version` > reader's supported version → reject (new
-    ///     required fields the reader cannot enforce).
-    ///   - Lower or equal versions are accepted, on the assumption that
-    ///     the reader knows how to interpret older manifests.
-    pub fn validate(&self) -> crate::Result<()> {
-        if self.format_version > NEST_FORMAT_VERSION {
-            return Err(NestError::UnsupportedFormatVersion(self.format_version));
-        }
-        if self.schema_version > NEST_SCHEMA_VERSION {
-            return Err(NestError::UnsupportedSchemaVersion(self.schema_version));
-        }
-        if self.embedding_model.is_empty() {
-            return Err(NestError::ManifestInvalid(
-                "embedding_model must not be empty".into(),
-            ));
-        }
-        if self.embedding_dim == 0 {
-            return Err(NestError::ManifestInvalid(
-                "embedding_dim must be > 0".into(),
-            ));
-        }
-        if self.n_chunks == 0 {
-            return Err(NestError::ManifestInvalid("n_chunks must be > 0".into()));
-        }
-        if self.chunker_version.is_empty() {
-            return Err(NestError::ManifestInvalid(
-                "chunker_version must not be empty".into(),
-            ));
-        }
-        validate_model_hash(&self.model_hash)?;
-
-        if !ALLOWED_DTYPES.contains(&self.dtype.as_str()) {
-            return Err(NestError::UnsupportedDType(self.dtype.clone()));
-        }
-        if self.metric != SUPPORTED_METRIC {
-            return Err(NestError::UnsupportedMetric(self.metric.clone()));
-        }
-        if !ALLOWED_SCORE_TYPES.contains(&self.score_type.as_str()) {
-            return Err(NestError::UnsupportedScoreType(self.score_type.clone()));
-        }
-        if self.normalize != SUPPORTED_NORMALIZE {
-            return Err(NestError::UnsupportedNormalize(self.normalize.clone()));
-        }
-        if !ALLOWED_INDEX_TYPES.contains(&self.index_type.as_str()) {
-            return Err(NestError::UnsupportedIndexType(self.index_type.clone()));
-        }
-        if !ALLOWED_RERANK_POLICIES.contains(&self.rerank_policy.as_str()) {
-            return Err(NestError::UnsupportedRerankPolicy(
-                self.rerank_policy.clone(),
-            ));
-        }
-        // ANN/hybrid index_types must declare an exact rerank so the final
-        // score remains the real cosine value the user can trust.
-        if (self.index_type == "hnsw" || self.index_type == "hybrid")
-            && self.rerank_policy != "exact"
-        {
-            return Err(NestError::ManifestInvalid(format!(
-                "index_type={} requires rerank_policy=\"exact\"",
-                self.index_type
-            )));
-        }
-        if !self.capabilities.supports_exact {
-            return Err(NestError::ManifestInvalid(
-                "capabilities.supports_exact must be true (exact path is the ground truth)".into(),
-            ));
-        }
-        if !self.capabilities.supports_reproducible_build {
-            return Err(NestError::ManifestInvalid(
-                "capabilities.supports_reproducible_build must be true".into(),
-            ));
-        }
-        if self.index_type == "hnsw" && !self.capabilities.supports_ann {
-            return Err(NestError::ManifestInvalid(
-                "index_type=hnsw requires capabilities.supports_ann=true".into(),
-            ));
-        }
-        if self.index_type == "hybrid" && !self.capabilities.supports_bm25 {
-            return Err(NestError::ManifestInvalid(
-                "index_type=hybrid requires capabilities.supports_bm25=true".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Serialize the manifest to canonical JSON: declaration order for the
-    /// known fields, BTreeMap order for `extra`, no whitespace.
-    pub fn to_canonical_json(&self) -> crate::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let mut ser =
-            serde_json::Serializer::with_formatter(&mut buf, serde_json::ser::CompactFormatter);
-        self.serialize(&mut ser).map_err(NestError::Json)?;
-        Ok(buf)
-    }
-}
-
-/// A model_hash must be of the form `sha256:<64 hex chars>`. Anything else
-/// is a contract violation: we want every claim about provenance to be
-/// machine-verifiable.
-fn validate_model_hash(s: &str) -> crate::Result<()> {
-    let rest = s.strip_prefix("sha256:").ok_or_else(|| {
-        NestError::InvalidModelHash(format!("expected 'sha256:<hex>' prefix, got '{}'", s))
-    })?;
-    if rest.len() != 64 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(NestError::InvalidModelHash(format!(
-            "expected 64 hex chars after 'sha256:', got '{}'",
-            rest
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::NestError;
 
-    fn good_manifest() -> Manifest {
+    pub(super) fn good_manifest() -> Manifest {
         Manifest {
             embedding_model: "demo".into(),
             embedding_dim: 4,
@@ -267,10 +143,6 @@ mod tests {
 
     #[test]
     fn accepts_older_format_version() {
-        // Writer has not yet bumped format_version, so we cannot exercise
-        // a true skew here without a fake. As soon as a v2 ships, the
-        // assertion below remains a v1 reader's contract: smaller versions
-        // are accepted (assuming required field set is unchanged).
         let mut m = good_manifest();
         if NEST_FORMAT_VERSION > 0 {
             m.format_version = NEST_FORMAT_VERSION - 1;

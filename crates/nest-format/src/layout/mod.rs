@@ -14,8 +14,13 @@
 //!
 //! All multi-byte integers are little-endian, unsigned unless noted.
 
-use crate::error::NestError;
-use sha2::{Digest, Sha256};
+mod footer;
+mod header;
+mod section_entry;
+
+pub use footer::NestFooter;
+pub use header::NestHeader;
+pub use section_entry::SectionEntry;
 
 pub const NEST_MAGIC: &[u8; 4] = b"NEST";
 pub const NEST_VERSION_MAJOR: u16 = 1;
@@ -114,193 +119,6 @@ pub fn section_name(id: u32) -> Option<&'static str> {
 ///   u64 entry_count (LE)
 pub const SECTION_PAYLOAD_PREFIX_SIZE: usize = 12;
 pub const SECTION_PAYLOAD_VERSION: u32 = 1;
-
-/// Fixed-size binary header (128 bytes).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NestHeader {
-    pub magic: [u8; 4],
-    pub version_major: u16,
-    pub version_minor: u16,
-    pub flags: u32,
-    pub embedding_dim: u32,
-    pub n_chunks: u64,
-    pub n_embeddings: u64,
-    pub file_size: u64,
-    pub section_table_offset: u64,
-    pub section_table_count: u64,
-    pub manifest_offset: u64,
-    pub manifest_size: u64,
-    pub header_checksum: [u8; 8],
-    pub reserved: [u8; 48],
-}
-
-impl NestHeader {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        embedding_dim: u32,
-        n_chunks: u64,
-        n_embeddings: u64,
-        file_size: u64,
-        section_table_offset: u64,
-        section_table_count: u64,
-        manifest_offset: u64,
-        manifest_size: u64,
-    ) -> Self {
-        let mut h = Self {
-            magic: *NEST_MAGIC,
-            version_major: NEST_VERSION_MAJOR,
-            version_minor: NEST_VERSION_MINOR,
-            flags: 0,
-            embedding_dim,
-            n_chunks,
-            n_embeddings,
-            file_size,
-            section_table_offset,
-            section_table_count,
-            manifest_offset,
-            manifest_size,
-            header_checksum: [0; 8],
-            reserved: [0; 48],
-        };
-        h.compute_checksum();
-        h
-    }
-
-    pub fn compute_checksum(&mut self) {
-        let bytes = self.as_bytes_without_checksum();
-        let hash = Sha256::digest(&bytes);
-        self.header_checksum.copy_from_slice(&hash[..8]);
-    }
-
-    pub fn validate_checksum(&self) -> crate::Result<()> {
-        let mut tmp = *self;
-        tmp.header_checksum = [0; 8];
-        let bytes = tmp.as_bytes_without_checksum();
-        let hash = Sha256::digest(&bytes);
-        if hash[..8] != self.header_checksum[..] {
-            return Err(NestError::InvalidHeaderChecksum);
-        }
-        Ok(())
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        let size = std::mem::size_of::<Self>();
-        unsafe { std::slice::from_raw_parts(self as *const _ as *const u8, size) }
-    }
-
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        let size = std::mem::size_of::<Self>();
-        unsafe { std::slice::from_raw_parts_mut(self as *mut _ as *mut u8, size) }
-    }
-
-    fn as_bytes_without_checksum(&self) -> Vec<u8> {
-        let bytes = self.as_bytes();
-        let mut v = bytes[..72].to_vec();
-        v.extend_from_slice(&bytes[80..]);
-        v
-    }
-}
-
-impl Default for NestHeader {
-    fn default() -> Self {
-        Self::new(0, 0, 0, 128, 128, 0, 128, 0)
-    }
-}
-
-/// Section table entry (32 bytes).
-///
-/// `offset` is 64-byte aligned (see `SECTION_ALIGNMENT`). `size` is the
-/// length of the actual payload, NOT including the trailing padding.
-/// `encoding` declares the on-disk payload format; v1 only supports
-/// `SECTION_ENCODING_RAW` (0).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SectionEntry {
-    pub section_id: u32,
-    pub encoding: u32,
-    pub offset: u64,
-    pub size: u64,
-    pub checksum: [u8; 8],
-}
-
-impl SectionEntry {
-    pub fn new(section_id: u32, offset: u64, size: u64) -> Self {
-        Self {
-            section_id,
-            encoding: SECTION_ENCODING_RAW,
-            offset,
-            size,
-            checksum: [0; 8],
-        }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        let size = std::mem::size_of::<Self>();
-        unsafe { std::slice::from_raw_parts(self as *const _ as *const u8, size) }
-    }
-
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        let size = std::mem::size_of::<Self>();
-        unsafe { std::slice::from_raw_parts_mut(self as *mut _ as *mut u8, size) }
-    }
-
-    pub fn compute_checksum(&mut self, data: &[u8]) {
-        let hash = Sha256::digest(data);
-        self.checksum.copy_from_slice(&hash[..8]);
-    }
-
-    pub fn validate_checksum(&self, data: &[u8]) -> crate::Result<()> {
-        let hash = Sha256::digest(data);
-        if hash[..8] != self.checksum[..] {
-            return Err(NestError::SectionChecksumMismatch(self.section_id));
-        }
-        Ok(())
-    }
-}
-
-/// Footer (40 bytes).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NestFooter {
-    pub footer_size: u64,
-    pub file_hash: [u8; 32],
-}
-
-impl NestFooter {
-    pub fn new(file_hash: [u8; 32]) -> Self {
-        Self {
-            footer_size: NEST_FOOTER_SIZE as u64,
-            file_hash,
-        }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        let size = std::mem::size_of::<Self>();
-        unsafe { std::slice::from_raw_parts(self as *const _ as *const u8, size) }
-    }
-
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        let size = std::mem::size_of::<Self>();
-        unsafe { std::slice::from_raw_parts_mut(self as *mut _ as *mut u8, size) }
-    }
-
-    pub fn compute_file_hash(data_without_footer: &[u8]) -> [u8; 32] {
-        let hash = Sha256::digest(data_without_footer);
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&hash[..]);
-        out
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> crate::Result<Self> {
-        if bytes.len() < std::mem::size_of::<Self>() {
-            return Err(NestError::UnexpectedEof);
-        }
-        let mut footer = NestFooter::new([0; 32]);
-        footer.as_bytes_mut().copy_from_slice(bytes);
-        Ok(footer)
-    }
-}
 
 #[cfg(test)]
 mod tests {
