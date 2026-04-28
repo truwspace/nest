@@ -4,7 +4,23 @@
 //! `mmap`). Parsing validates magic, header checksum, file_size, all
 //! section checksums, footer hash, manifest schema, and the presence of
 //! every required section.
+//!
+//! Section payloads come in three encodings (`SECTION_ENCODING_*`):
+//! - `raw`: the section bytes ARE the canonical payload.
+//! - `zstd`: stored compressed; the reader decompresses on demand and
+//!   returns an owned `Cow::Owned` buffer.
+//! - `float16` / `int8`: only valid for the embeddings section; the
+//!   physical bytes are also the canonical bytes (the runtime
+//!   dispatches on `manifest.dtype`).
+//!
+//! Section checksums hash the **physical** bytes as stored.
+//! `content_hash` hashes the **decoded** bytes so a zstd-compressed
+//! corpus and its raw equivalent share the same content_hash (and
+//! therefore the same citation URIs).
 
+use std::borrow::Cow;
+
+use crate::encoding::{decode_payload, expected_embeddings_size};
 use crate::error::NestError;
 use crate::layout::*;
 use crate::manifest::Manifest;
@@ -84,12 +100,7 @@ impl<'a> NestView<'a> {
         // ---- section bounds + alignment + encoding + checksums --------
         let body_end = data.len() - NEST_FOOTER_SIZE;
         for entry in &section_table {
-            if entry.encoding != SECTION_ENCODING_RAW {
-                return Err(NestError::UnsupportedSectionEncoding {
-                    section_id: entry.section_id,
-                    encoding: entry.encoding,
-                });
-            }
+            validate_encoding_for_section(entry.section_id, entry.encoding)?;
             if entry.offset % SECTION_ALIGNMENT != 0 {
                 return Err(NestError::SectionMisaligned {
                     section_id: entry.section_id,
@@ -178,15 +189,42 @@ impl<'a> NestView<'a> {
         self.data
     }
 
+    /// Look up the section table entry for `section_id`.
+    pub fn entry(&self, section_id: u32) -> crate::Result<&SectionEntry> {
+        self.section_table
+            .iter()
+            .find(|e| e.section_id == section_id)
+            .ok_or(NestError::SectionNotFound(section_id))
+    }
+
+    /// Physical (on-disk, mmap-backed) bytes of a section's payload.
+    /// Use `decoded_section` if you want the logical bytes (e.g. zstd
+    /// decompressed) the chunk decoders consume.
     pub fn get_section_data(&self, section_id: u32) -> crate::Result<&'a [u8]> {
-        for entry in &self.section_table {
-            if entry.section_id == section_id {
-                let start = entry.offset as usize;
-                let end = start + entry.size as usize;
-                return Ok(&self.data[start..end]);
+        let entry = self.entry(section_id)?;
+        let start = entry.offset as usize;
+        let end = start + entry.size as usize;
+        Ok(&self.data[start..end])
+    }
+
+    /// Logical (decoded) bytes of a section's payload. Borrows for raw
+    /// encoding; copies for zstd. Float16/int8 embedding payloads are
+    /// returned as-is — the runtime dispatches on `manifest.dtype`.
+    pub fn decoded_section(&self, section_id: u32) -> crate::Result<Cow<'a, [u8]>> {
+        let entry = self.entry(section_id)?;
+        let phys = self.get_section_data(section_id)?;
+        decode_payload(entry.encoding, phys).map_err(|e| match e {
+            NestError::UnsupportedSectionEncoding { encoding, .. } => {
+                NestError::UnsupportedSectionEncoding {
+                    section_id,
+                    encoding,
+                }
             }
-        }
-        Err(NestError::SectionNotFound(section_id))
+            NestError::MalformedSectionPayload { reason, .. } => {
+                NestError::MalformedSectionPayload { section_id, reason }
+            }
+            other => other,
+        })
     }
 
     fn check_required_sections(&self) -> crate::Result<()> {
@@ -199,27 +237,43 @@ impl<'a> NestView<'a> {
     }
 
     fn validate_embeddings_layout(&self) -> crate::Result<()> {
-        let data = self.get_section_data(SECTION_EMBEDDINGS)?;
+        let entry = self.entry(SECTION_EMBEDDINGS)?;
         let dim = self.header.embedding_dim as usize;
         let n = self.header.n_embeddings as usize;
-        let expected = n.checked_mul(dim).and_then(|v| v.checked_mul(4)).ok_or(
-            NestError::EmbeddingSizeMismatch {
-                expected: 0,
-                got: data.len(),
-            },
-        )?;
-        if data.len() != expected {
+        let dtype = self.manifest.dtype.as_str();
+
+        // Encoding/dtype consistency: float16 dtype implies float16 encoding,
+        // int8 dtype implies int8 encoding, float32 dtype implies raw or zstd
+        // (zstd on embeddings is rejected separately, see validate_encoding_for_section).
+        let valid_combo = matches!(
+            (dtype, entry.encoding),
+            ("float32", SECTION_ENCODING_RAW)
+                | ("float16", SECTION_ENCODING_FLOAT16)
+                | ("int8", SECTION_ENCODING_INT8)
+        );
+        if !valid_combo {
+            return Err(NestError::ManifestInvalid(format!(
+                "embeddings section encoding={} does not match dtype={}",
+                entry.encoding, dtype
+            )));
+        }
+
+        let want = expected_embeddings_size(dtype, n, dim).ok_or_else(|| {
+            NestError::UnsupportedDType(format!("unknown embeddings dtype: {}", dtype))
+        })?;
+        let got = entry.size as usize;
+        if got != want {
             return Err(NestError::EmbeddingSizeMismatch {
-                expected,
-                got: data.len(),
+                expected: want,
+                got,
             });
         }
         Ok(())
     }
 
     fn validate_search_contract(&self) -> crate::Result<()> {
-        let bytes = self.get_section_data(SECTION_SEARCH_CONTRACT)?;
-        let contract = decode_search_contract(bytes)?;
+        let bytes = self.decoded_section(SECTION_SEARCH_CONTRACT)?;
+        let contract = decode_search_contract(&bytes)?;
         if contract.metric != self.manifest.metric {
             return Err(NestError::UnsupportedMetric(format!(
                 "section says {} but manifest says {}",
@@ -253,14 +307,48 @@ impl<'a> NestView<'a> {
         Ok(())
     }
 
-    /// Walk the embeddings section and reject any NaN/Inf value.
+    /// Walk the embeddings section and reject any NaN/Inf value. Works
+    /// for all supported dtypes by decoding to f32 first.
     pub fn validate_embeddings_values(&self) -> crate::Result<()> {
         self.validate_embeddings_layout()?;
+        let entry = self.entry(SECTION_EMBEDDINGS)?;
         let data = self.get_section_data(SECTION_EMBEDDINGS)?;
-        for chunk in data.chunks_exact(4) {
-            let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            if v.is_nan() || v.is_infinite() {
-                return Err(NestError::InvalidEmbeddingValue);
+        match entry.encoding {
+            SECTION_ENCODING_RAW => {
+                for chunk in data.chunks_exact(4) {
+                    let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    if v.is_nan() || v.is_infinite() {
+                        return Err(NestError::InvalidEmbeddingValue);
+                    }
+                }
+            }
+            SECTION_ENCODING_FLOAT16 => {
+                for chunk in data.chunks_exact(2) {
+                    let h = half::f16::from_le_bytes([chunk[0], chunk[1]]);
+                    let v = h.to_f32();
+                    if v.is_nan() || v.is_infinite() {
+                        return Err(NestError::InvalidEmbeddingValue);
+                    }
+                }
+            }
+            SECTION_ENCODING_INT8 => {
+                // i8 cannot encode NaN/Inf; only the per-vector scales
+                // could be NaN/Inf. Decode the int8 prefix and check.
+                let n = self.header.n_embeddings as usize;
+                let dim = self.header.embedding_dim as usize;
+                let view = crate::encoding::Int8EmbeddingsView::parse(data, n, dim)?;
+                for i in 0..view.n {
+                    let s = view.scale(i);
+                    if s.is_nan() || s.is_infinite() {
+                        return Err(NestError::InvalidEmbeddingValue);
+                    }
+                }
+            }
+            other => {
+                return Err(NestError::UnsupportedSectionEncoding {
+                    section_id: SECTION_EMBEDDINGS,
+                    encoding: other,
+                });
             }
         }
         Ok(())
@@ -269,7 +357,8 @@ impl<'a> NestView<'a> {
     /// Decode the `search_contract` section. Already validated to agree
     /// with the manifest at construction time.
     pub fn search_contract(&self) -> crate::Result<SearchContract> {
-        decode_search_contract(self.get_section_data(SECTION_SEARCH_CONTRACT)?)
+        let bytes = self.decoded_section(SECTION_SEARCH_CONTRACT)?;
+        decode_search_contract(&bytes)
     }
 
     /// `sha256:<hex>` of the file as written, including the footer.
@@ -280,23 +369,45 @@ impl<'a> NestView<'a> {
     }
 
     /// `sha256:<hex>` of the canonical sections in the order fixed by spec
-    /// (see `CANONICAL_SECTIONS`). Adding a section with a smaller numeric
-    /// id cannot reshuffle this hash. All required sections were proved
-    /// present at construction time, so in practice this never returns
-    /// `Err`; the `Result` is preserved so callers never have to absorb
-    /// a panic.
+    /// (see `CANONICAL_SECTIONS`). Hashes the **decoded** bytes so two
+    /// files that wire-compress the same logical content (zstd vs raw)
+    /// produce the same content_hash and therefore stable citations.
+    /// Quantized embeddings (float16 / int8) hash their on-disk bytes —
+    /// they're already the canonical representation for that precision.
+    /// Optional sections (HNSW, BM25) are NOT included.
     pub fn content_hash_hex(&self) -> crate::Result<String> {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         for (id, name) in CANONICAL_SECTIONS {
-            let data = self.get_section_data(*id)?;
+            let bytes = self.decoded_section(*id)?;
             // Domain-separate by name length + name bytes so hashes for
             // different sections cannot collide via concatenation.
             h.update((name.len() as u32).to_le_bytes());
             h.update(name.as_bytes());
-            h.update((data.len() as u64).to_le_bytes());
-            h.update(data);
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes.as_ref());
         }
         Ok(format!("sha256:{:x}", h.finalize()))
     }
+}
+
+/// Encoding rules: the embeddings section gets dtype-specific encodings
+/// (float16, int8) and rejects zstd (we want SIMD-friendly mmap reads).
+/// All other sections accept raw or zstd.
+fn validate_encoding_for_section(section_id: u32, encoding: u32) -> crate::Result<()> {
+    let allowed = if section_id == SECTION_EMBEDDINGS {
+        matches!(
+            encoding,
+            SECTION_ENCODING_RAW | SECTION_ENCODING_FLOAT16 | SECTION_ENCODING_INT8
+        )
+    } else {
+        matches!(encoding, SECTION_ENCODING_RAW | SECTION_ENCODING_ZSTD)
+    };
+    if !allowed {
+        return Err(NestError::UnsupportedSectionEncoding {
+            section_id,
+            encoding,
+        });
+    }
+    Ok(())
 }

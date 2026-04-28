@@ -149,6 +149,20 @@ class BuildConfig:
     description: str | None = None
     license: str | None = None
     reproducible: bool = True
+    # Encoding presets:
+    #   "exact"      — raw text, float32 embeddings, no ANN, no BM25
+    #   "compressed" — zstd text, float16 embeddings, no ANN, no BM25
+    #   "tiny"       — zstd text, int8 embeddings, HNSW, no BM25
+    #   "hybrid"     — zstd text, float32 embeddings, HNSW, BM25
+    preset: str = "exact"
+    # Per-knob overrides (None = inherit from preset)
+    text_encoding: str | None = None        # "raw" | "zstd"
+    dtype: str | None = None                # "float32" | "float16" | "int8"
+    with_hnsw: bool | None = None
+    with_bm25: bool | None = None
+    hnsw_m: int = 16
+    hnsw_ef_construction: int = 200
+    hnsw_seed: int = 42
 
 
 class Pipeline:
@@ -249,6 +263,14 @@ class Pipeline:
             license=self.cfg.license,
             provenance=provenance,
             reproducible=self.cfg.reproducible,
+            preset=self.cfg.preset,
+            text_encoding=self.cfg.text_encoding,
+            dtype=self.cfg.dtype,
+            with_hnsw=self.cfg.with_hnsw,
+            with_bm25=self.cfg.with_bm25,
+            hnsw_m=self.cfg.hnsw_m,
+            hnsw_ef_construction=self.cfg.hnsw_ef_construction,
+            hnsw_seed=self.cfg.hnsw_seed,
         )
 
         # Final integrity check via the in-process reader (PyO3 path).

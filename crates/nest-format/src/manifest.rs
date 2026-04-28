@@ -3,13 +3,24 @@ use crate::layout::{NEST_FORMAT_VERSION, NEST_SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Supported dtype in v1.
+/// Default embedding dtype; v1.0 ships float32 as the recall-max baseline.
+/// Compressed/quantized presets declare `dtype = "float16"` or `"int8"`.
 pub const SUPPORTED_DTYPE: &str = "float32";
 pub const SUPPORTED_METRIC: &str = "ip";
 pub const SUPPORTED_SCORE_TYPE: &str = "cosine";
 pub const SUPPORTED_NORMALIZE: &str = "l2";
 pub const SUPPORTED_INDEX_TYPE: &str = "exact";
 pub const SUPPORTED_RERANK_POLICY: &str = "none";
+
+/// Every dtype the reader understands for the embeddings section.
+pub const ALLOWED_DTYPES: &[&str] = &["float32", "float16", "int8"];
+/// Every index_type the reader understands for the search path.
+pub const ALLOWED_INDEX_TYPES: &[&str] = &["exact", "hnsw", "hybrid"];
+/// Every rerank policy the reader understands. `exact` means an ANN/BM25
+/// candidate set is rescored with real cosine before returning.
+pub const ALLOWED_RERANK_POLICIES: &[&str] = &["none", "exact"];
+/// Every score_type the reader understands.
+pub const ALLOWED_SCORE_TYPES: &[&str] = &["cosine", "hybrid_rrf"];
 
 /// Capabilities advertised by a .nest file. v1 only requires `supports_exact`
 /// and `supports_reproducible_build` to be true; the rest are forward-looking
@@ -139,34 +150,54 @@ impl Manifest {
         }
         validate_model_hash(&self.model_hash)?;
 
-        if self.dtype != SUPPORTED_DTYPE {
+        if !ALLOWED_DTYPES.contains(&self.dtype.as_str()) {
             return Err(NestError::UnsupportedDType(self.dtype.clone()));
         }
         if self.metric != SUPPORTED_METRIC {
             return Err(NestError::UnsupportedMetric(self.metric.clone()));
         }
-        if self.score_type != SUPPORTED_SCORE_TYPE {
+        if !ALLOWED_SCORE_TYPES.contains(&self.score_type.as_str()) {
             return Err(NestError::UnsupportedScoreType(self.score_type.clone()));
         }
         if self.normalize != SUPPORTED_NORMALIZE {
             return Err(NestError::UnsupportedNormalize(self.normalize.clone()));
         }
-        if self.index_type != SUPPORTED_INDEX_TYPE {
+        if !ALLOWED_INDEX_TYPES.contains(&self.index_type.as_str()) {
             return Err(NestError::UnsupportedIndexType(self.index_type.clone()));
         }
-        if self.rerank_policy != SUPPORTED_RERANK_POLICY {
+        if !ALLOWED_RERANK_POLICIES.contains(&self.rerank_policy.as_str()) {
             return Err(NestError::UnsupportedRerankPolicy(
                 self.rerank_policy.clone(),
             ));
         }
+        // ANN/hybrid index_types must declare an exact rerank so the final
+        // score remains the real cosine value the user can trust.
+        if (self.index_type == "hnsw" || self.index_type == "hybrid")
+            && self.rerank_policy != "exact"
+        {
+            return Err(NestError::ManifestInvalid(format!(
+                "index_type={} requires rerank_policy=\"exact\"",
+                self.index_type
+            )));
+        }
         if !self.capabilities.supports_exact {
             return Err(NestError::ManifestInvalid(
-                "capabilities.supports_exact must be true in v1".into(),
+                "capabilities.supports_exact must be true (exact path is the ground truth)".into(),
             ));
         }
         if !self.capabilities.supports_reproducible_build {
             return Err(NestError::ManifestInvalid(
-                "capabilities.supports_reproducible_build must be true in v1".into(),
+                "capabilities.supports_reproducible_build must be true".into(),
+            ));
+        }
+        if self.index_type == "hnsw" && !self.capabilities.supports_ann {
+            return Err(NestError::ManifestInvalid(
+                "index_type=hnsw requires capabilities.supports_ann=true".into(),
+            ));
+        }
+        if self.index_type == "hybrid" && !self.capabilities.supports_bm25 {
+            return Err(NestError::ManifestInvalid(
+                "index_type=hybrid requires capabilities.supports_bm25=true".into(),
             ));
         }
         Ok(())
@@ -260,8 +291,41 @@ mod tests {
     #[test]
     fn rejects_unsupported_dtype() {
         let mut m = good_manifest();
-        m.dtype = "float16".into();
+        m.dtype = "bfloat16".into();
         assert!(matches!(m.validate(), Err(NestError::UnsupportedDType(_))));
+    }
+
+    #[test]
+    fn accepts_float16_and_int8_dtypes() {
+        for dt in ["float32", "float16", "int8"] {
+            let mut m = good_manifest();
+            m.dtype = dt.into();
+            m.validate()
+                .unwrap_or_else(|e| panic!("{} rejected: {}", dt, e));
+        }
+    }
+
+    #[test]
+    fn hnsw_requires_exact_rerank() {
+        let mut m = good_manifest();
+        m.index_type = "hnsw".into();
+        m.rerank_policy = "none".into();
+        m.capabilities.supports_ann = true;
+        assert!(matches!(m.validate(), Err(NestError::ManifestInvalid(_))));
+        m.rerank_policy = "exact".into();
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn hybrid_requires_bm25_capability() {
+        let mut m = good_manifest();
+        m.index_type = "hybrid".into();
+        m.rerank_policy = "exact".into();
+        m.score_type = "hybrid_rrf".into();
+        m.capabilities.supports_bm25 = false;
+        assert!(matches!(m.validate(), Err(NestError::ManifestInvalid(_))));
+        m.capabilities.supports_bm25 = true;
+        m.validate().unwrap();
     }
 
     #[test]

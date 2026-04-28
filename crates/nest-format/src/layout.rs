@@ -37,15 +37,24 @@ pub fn align_up(n: u64, a: u64) -> u64 {
     (n + a - 1) & !(a - 1)
 }
 
-/// Section payload encoding. v1 only supports `raw`; other values are
-/// reserved for future compressed/quantized payloads (zstd, float16,
-/// int8). A reader that sees an encoding it does not understand must
-/// reject the file with `UnsupportedSectionEncoding`.
+/// Section payload encoding.
+///
+/// - `0 = raw`: payload is the canonical bytes as the reader consumes them.
+///   Used for embeddings (float32) and any non-compressed metadata section.
+/// - `1 = zstd`: payload is zstd-compressed canonical bytes. Only valid for
+///   non-embedding sections; the reader transparently decompresses.
+/// - `2 = float16`: payload is `n * dim * 2` bytes of f16 LE; requires the
+///   manifest to declare `dtype = "float16"`. Only valid for the embeddings
+///   section.
+/// - `3 = int8`: payload is the int8 quantized embeddings section (per-vector
+///   f32 scales followed by i8 vectors); requires `dtype = "int8"`. Only
+///   valid for the embeddings section.
+///
+/// A reader rejects unknown encodings with `UnsupportedSectionEncoding`.
 pub const SECTION_ENCODING_RAW: u32 = 0;
-// Reserved for future use:
-//   pub const SECTION_ENCODING_ZSTD: u32 = 1;
-//   pub const SECTION_ENCODING_FLOAT16: u32 = 2;
-//   pub const SECTION_ENCODING_INT8: u32 = 3;
+pub const SECTION_ENCODING_ZSTD: u32 = 1;
+pub const SECTION_ENCODING_FLOAT16: u32 = 2;
+pub const SECTION_ENCODING_INT8: u32 = 3;
 
 /// Format version of the binary layout. Bumped when the on-disk
 /// container changes (header/footer/section table layout).
@@ -55,14 +64,17 @@ pub const NEST_FORMAT_VERSION: u32 = 1;
 /// fields or required section semantics change.
 pub const NEST_SCHEMA_VERSION: u32 = 1;
 
-// Section IDs (v1). Each section also has a canonical name used for
-// content_hash computation and for required-section validation.
+// Section IDs. The first six are required (v1 contract); the rest are
+// optional and only present when the manifest's `capabilities` declare
+// them.
 pub const SECTION_CHUNK_IDS: u32 = 0x01;
 pub const SECTION_CHUNKS_CANONICAL: u32 = 0x02;
 pub const SECTION_CHUNKS_ORIGINAL_SPANS: u32 = 0x03;
 pub const SECTION_EMBEDDINGS: u32 = 0x04;
 pub const SECTION_PROVENANCE: u32 = 0x05;
 pub const SECTION_SEARCH_CONTRACT: u32 = 0x06;
+pub const SECTION_HNSW_INDEX: u32 = 0x07;
+pub const SECTION_BM25_INDEX: u32 = 0x08;
 
 /// Canonical order for content_hash. Sorted alphabetically by name; this
 /// order is fixed by spec so adding new section IDs cannot reshuffle the
@@ -80,9 +92,19 @@ pub const CANONICAL_SECTIONS: &[(u32, &str)] = &[
 /// missing one of these with `MissingRequiredSection`.
 pub const REQUIRED_SECTIONS: &[(u32, &str)] = CANONICAL_SECTIONS;
 
+/// Optional sections — present when their corresponding capability is
+/// advertised in the manifest. They do NOT participate in content_hash
+/// (which is over the canonical six only) so adding an optional section
+/// to a corpus does not invalidate citations.
+pub const OPTIONAL_SECTIONS: &[(u32, &str)] = &[
+    (SECTION_HNSW_INDEX, "hnsw_index"),
+    (SECTION_BM25_INDEX, "bm25_index"),
+];
+
 pub fn section_name(id: u32) -> Option<&'static str> {
     CANONICAL_SECTIONS
         .iter()
+        .chain(OPTIONAL_SECTIONS.iter())
         .find(|(sid, _)| *sid == id)
         .map(|(_, name)| *name)
 }

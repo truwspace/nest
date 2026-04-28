@@ -1,4 +1,5 @@
 pub mod chunk;
+pub mod encoding;
 pub mod error;
 pub mod layout;
 pub mod manifest;
@@ -7,6 +8,10 @@ pub mod sections;
 pub mod writer;
 
 pub use chunk::{ChunkInput, chunk_id};
+pub use encoding::{
+    DEFAULT_ZSTD_LEVEL, Int8EmbeddingsView, decode_payload, encode_int8_embeddings,
+    expected_embeddings_size, f16_bytes_to_f32, f32_to_f16_bytes, quantize_f32_to_i8, zstd_encode,
+};
 pub use error::{NestError, Result};
 pub use layout::*;
 pub use manifest::{Capabilities, Manifest};
@@ -15,4 +20,4 @@ pub use sections::{
     OriginalSpan, SearchContract, decode_chunk_ids, decode_chunks_canonical,
     decode_chunks_original_spans, decode_provenance, decode_search_contract,
 };
-pub use writer::NestFileBuilder;
+pub use writer::{EmbeddingDType, NestFileBuilder, SectionEncoding};

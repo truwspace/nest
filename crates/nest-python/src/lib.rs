@@ -27,6 +27,38 @@ impl NestFile {
         Ok(res.hits.into_iter().map(SearchHitPy::from).collect())
     }
 
+    /// HNSW ANN search with exact rerank. Falls back to `search()` if
+    /// the file has no HNSW section.
+    fn search_ann(&self, query: &Bound<PyAny>, k: i32, ef: usize) -> PyResult<Vec<SearchHitPy>> {
+        let qvec: Vec<f32> = query
+            .extract()
+            .map_err(|e| PyValueError::new_err(format!("invalid query vector: {}", e)))?;
+        let res = self
+            .rt
+            .search_ann(&qvec, k, ef)
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        Ok(res.hits.into_iter().map(SearchHitPy::from).collect())
+    }
+
+    /// Hybrid (BM25 ∪ vector → exact rerank). Falls back to `search()`
+    /// when no BM25 section is present.
+    fn search_hybrid(
+        &self,
+        query: &Bound<PyAny>,
+        query_text: &str,
+        k: i32,
+        candidates: usize,
+    ) -> PyResult<Vec<SearchHitPy>> {
+        let qvec: Vec<f32> = query
+            .extract()
+            .map_err(|e| PyValueError::new_err(format!("invalid query vector: {}", e)))?;
+        let res = self
+            .rt
+            .search_hybrid(&qvec, query_text, k, candidates)
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
+        Ok(res.hits.into_iter().map(SearchHitPy::from).collect())
+    }
+
     #[getter]
     fn embedding_dim(&self) -> usize {
         self.rt.embedding_dim()
@@ -35,6 +67,26 @@ impl NestFile {
     #[getter]
     fn n_embeddings(&self) -> usize {
         self.rt.n_embeddings()
+    }
+
+    #[getter]
+    fn dtype(&self) -> &'static str {
+        self.rt.dtype().name()
+    }
+
+    #[getter]
+    fn simd_backend(&self) -> &'static str {
+        self.rt.simd_backend().name()
+    }
+
+    #[getter]
+    fn has_ann(&self) -> bool {
+        self.rt.has_ann()
+    }
+
+    #[getter]
+    fn has_bm25(&self) -> bool {
+        self.rt.has_bm25()
     }
 
     #[getter]
@@ -116,19 +168,27 @@ impl From<nest_runtime::SearchHit> for SearchHitPy {
     }
 }
 
-/// Build a .nest v1 file from already-embedded chunks.
+/// Build a .nest file from already-embedded chunks.
 ///
 /// `chunks` is a list of dicts with keys:
 ///   - canonical_text: str
 ///   - source_uri: str
 ///   - byte_start: int
 ///   - byte_end: int
-///   - embedding: list[float] (length == embedding_dim)
+///   - embedding: list[float] (length == embedding_dim, L2-normalized)
 ///
 /// Optional manifest fields (`title`, `version`, `created`, `description`,
 /// `authors`, `license`) and a free-form `provenance` dict can be passed
 /// as kwargs. `reproducible=True` overrides `created` so two builds with
 /// identical inputs produce byte-identical output.
+///
+/// Preset / encoding kwargs:
+///   - `preset`: one of "exact" (default), "compressed", "tiny", "hybrid"
+///   - `text_encoding`: "raw" | "zstd" (overrides preset)
+///   - `dtype`: "float32" | "float16" | "int8" (overrides preset)
+///   - `with_hnsw`: bool (overrides preset; default per preset)
+///   - `with_bm25`: bool (overrides preset; default per preset)
+///   - `hnsw_m`, `hnsw_ef_construction`, `hnsw_seed`: HNSW knobs
 #[pyfunction]
 #[pyo3(signature = (
     output_path,
@@ -146,6 +206,14 @@ impl From<nest_runtime::SearchHit> for SearchHitPy {
     license=None,
     provenance=None,
     reproducible=false,
+    preset="exact",
+    text_encoding=None,
+    dtype=None,
+    with_hnsw=None,
+    with_bm25=None,
+    hnsw_m=16,
+    hnsw_ef_construction=200,
+    hnsw_seed=42,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build(
@@ -164,10 +232,18 @@ fn build(
     license: Option<String>,
     provenance: Option<&Bound<PyDict>>,
     reproducible: bool,
+    preset: &str,
+    text_encoding: Option<&str>,
+    dtype: Option<&str>,
+    with_hnsw: Option<bool>,
+    with_bm25: Option<bool>,
+    hnsw_m: usize,
+    hnsw_ef_construction: usize,
+    hnsw_seed: u64,
 ) -> PyResult<String> {
     use nest_format::ChunkInput;
     use nest_format::manifest::Manifest;
-    use nest_format::writer::NestFileBuilder;
+    use nest_format::writer::{EmbeddingDType, NestFileBuilder, SectionEncoding};
 
     let n_chunks = chunks.len() as u64;
     let mut chunk_inputs: Vec<ChunkInput> = Vec::with_capacity(n_chunks as usize);
@@ -215,6 +291,45 @@ fn build(
         None => serde_json::json!({}),
     };
 
+    // Resolve preset defaults; explicit kwargs win.
+    let (default_text_enc, default_dtype, default_hnsw, default_bm25) = match preset {
+        "exact" => (SectionEncoding::Raw, EmbeddingDType::Float32, false, false),
+        "compressed" => (SectionEncoding::Zstd, EmbeddingDType::Float16, false, false),
+        "tiny" => (SectionEncoding::Zstd, EmbeddingDType::Int8, true, false),
+        "hybrid" => (SectionEncoding::Zstd, EmbeddingDType::Float32, true, true),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown preset: {} (expected exact|compressed|tiny|hybrid)",
+                other
+            )));
+        }
+    };
+    let text_enc = match text_encoding {
+        Some("raw") => SectionEncoding::Raw,
+        Some("zstd") => SectionEncoding::Zstd,
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "unknown text_encoding: {} (expected raw|zstd)",
+                other
+            )));
+        }
+        None => default_text_enc,
+    };
+    let dt = match dtype {
+        Some("float32") => EmbeddingDType::Float32,
+        Some("float16") => EmbeddingDType::Float16,
+        Some("int8") => EmbeddingDType::Int8,
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "unknown dtype: {} (expected float32|float16|int8)",
+                other
+            )));
+        }
+        None => default_dtype,
+    };
+    let want_hnsw = with_hnsw.unwrap_or(default_hnsw);
+    let want_bm25 = with_bm25.unwrap_or(default_bm25);
+
     let manifest = Manifest {
         embedding_model: embedding_model.to_string(),
         embedding_dim,
@@ -230,10 +345,52 @@ fn build(
         ..Default::default()
     };
 
-    let bytes = NestFileBuilder::new(manifest)
+    let mut builder = NestFileBuilder::new(manifest)
         .reproducible(reproducible)
         .with_provenance(provenance_value)
-        .add_chunks(chunk_inputs)
+        .text_encoding(text_enc)
+        .embedding_dtype(dt);
+
+    // HNSW: build the index from f32 vectors (we have them in chunk_inputs
+    // already). The runtime materializes f32 vectors at open time too —
+    // here we use the originals so build is independent of dtype loss.
+    if want_hnsw {
+        let dim = embedding_dim as usize;
+        let n = chunk_inputs.len();
+        let mut flat: Vec<f32> = Vec::with_capacity(n * dim);
+        for c in &chunk_inputs {
+            flat.extend_from_slice(&c.embedding);
+        }
+        let idx = nest_runtime::ann::HnswIndex::build(
+            flat,
+            n,
+            dim,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_seed,
+        );
+        builder = builder.hnsw_index(idx.to_bytes());
+    }
+
+    if want_bm25 {
+        let docs: Vec<String> = chunk_inputs
+            .iter()
+            .map(|c| c.canonical_text.clone())
+            .collect();
+        let bm = nest_runtime::bm25::Bm25Index::build(
+            &docs,
+            nest_runtime::bm25::DEFAULT_K1,
+            nest_runtime::bm25::DEFAULT_B,
+        );
+        builder = builder.bm25_index(bm.to_bytes());
+        // hybrid preset already set index_type via text path; otherwise
+        // BM25 alone doesn't change the search path — runtime exposes
+        // it explicitly via search_hybrid.
+    }
+
+    builder = builder.add_chunks(chunk_inputs);
+
+    let bytes = builder
         .build_bytes()
         .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
     std::fs::write(output_path, &bytes)

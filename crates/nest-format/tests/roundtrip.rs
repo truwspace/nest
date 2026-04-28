@@ -424,7 +424,7 @@ fn citation_id_uses_content_hash_with_nest_scheme() {
 #[test]
 fn rejects_unsupported_dtype_in_manifest() {
     let mut m = manifest(4, 1);
-    m.dtype = "float16".into();
+    m.dtype = "bfloat16".into();
     let res = NestFileBuilder::new(m)
         .add_chunk(chunk("a", "b", 0, 1, vec![1.0, 0.0, 0.0, 0.0]))
         .build_bytes();

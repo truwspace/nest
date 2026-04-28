@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::process::Command as ProcCommand;
 
 #[derive(Parser)]
 #[command(name = "nest")]
@@ -16,12 +17,37 @@ enum Commands {
     Inspect { file: PathBuf },
     /// Validate file integrity (magic, checksums, hashes, manifest, contract).
     Validate { file: PathBuf },
-    /// Search a `.nest` file with a JSON-array query vector.
+    /// Search a `.nest` file with a JSON-array query vector (exact path).
     Search {
         file: PathBuf,
         query: String,
         #[arg(short, long, default_value = "10")]
         k: i32,
+    },
+    /// Search by raw text — embeds the query with the model declared in
+    /// the manifest, then runs the appropriate vector path. Honors the
+    /// declared `index_type` (exact / hnsw / hybrid).
+    SearchText {
+        file: PathBuf,
+        query: String,
+        #[arg(short, long, default_value = "10")]
+        k: i32,
+        /// Override the embedder script. Default: `python/embed_query.py`.
+        #[arg(long)]
+        embedder: Option<PathBuf>,
+        /// `ef` (HNSW) / candidates-per-path (hybrid). Default: 4*k or 64.
+        #[arg(long)]
+        candidates: Option<usize>,
+    },
+    /// Force the ANN (HNSW) path. Falls back to exact if the file has
+    /// no HNSW section.
+    SearchAnn {
+        file: PathBuf,
+        query: String,
+        #[arg(short, long, default_value = "10")]
+        k: i32,
+        #[arg(long, default_value = "100")]
+        ef: usize,
     },
     /// Benchmark exact flat search latency.
     Benchmark {
@@ -30,6 +56,9 @@ enum Commands {
         queries: usize,
         #[arg(short, long, default_value = "10")]
         k: i32,
+        /// If set, also benchmark `search_ann` with the given ef.
+        #[arg(long)]
+        ann: Option<usize>,
     },
     /// Show file stats.
     Stats { file: PathBuf },
@@ -48,7 +77,20 @@ fn main() -> Result<()> {
         Commands::Inspect { file } => cmd_inspect(file),
         Commands::Validate { file } => cmd_validate(file),
         Commands::Search { file, query, k } => cmd_search(file, query, k),
-        Commands::Benchmark { file, queries, k } => cmd_benchmark(file, queries, k),
+        Commands::SearchText {
+            file,
+            query,
+            k,
+            embedder,
+            candidates,
+        } => cmd_search_text(file, query, k, embedder, candidates),
+        Commands::SearchAnn { file, query, k, ef } => cmd_search_ann(file, query, k, ef),
+        Commands::Benchmark {
+            file,
+            queries,
+            k,
+            ann,
+        } => cmd_benchmark(file, queries, k, ann),
         Commands::Stats { file } => cmd_stats(file),
         Commands::Cite { file, citation } => cmd_cite(file, citation),
     }
@@ -67,10 +109,12 @@ fn cmd_inspect(file: PathBuf) -> Result<()> {
     println!("Sections:     {}", view.section_table.len());
     for entry in &view.section_table {
         let name = nest_format::layout::section_name(entry.section_id).unwrap_or("unknown");
+        let enc = encoding_name(entry.encoding);
         println!(
-            "  0x{:02x} {:<24} offset={} size={} checksum={}",
+            "  0x{:02x} {:<24} encoding={} offset={} size={} checksum={}",
             entry.section_id,
             name,
+            enc,
             entry.offset,
             entry.size,
             hex::encode(entry.checksum),
@@ -110,8 +154,97 @@ fn cmd_search(file: PathBuf, query: String, k: i32) -> Result<()> {
     let qvec: Vec<f32> =
         serde_json::from_str(&query).map_err(|e| anyhow::anyhow!("invalid query JSON: {}", e))?;
     let result = runtime.search(&qvec, k)?;
+    print_result(&result);
+    Ok(())
+}
+
+fn cmd_search_text(
+    file: PathBuf,
+    query: String,
+    k: i32,
+    embedder: Option<PathBuf>,
+    candidates: Option<usize>,
+) -> Result<()> {
+    let runtime = nest_runtime::MmapNestFile::open(&file)?;
+    // Read manifest model name from inspect_json so we don't open the
+    // file twice.
+    let info: serde_json::Value = serde_json::from_str(&runtime.inspect_json()?)?;
+    let model = info["manifest"]["embedding_model"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("manifest.embedding_model missing"))?
+        .to_string();
+    let declared_dim = info["manifest"]["embedding_dim"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("manifest.embedding_dim missing"))?
+        as usize;
+
+    let embedder = embedder.unwrap_or_else(default_embedder_path);
+    if !embedder.exists() {
+        anyhow::bail!(
+            "embedder script not found: {} (override with --embedder)",
+            embedder.display()
+        );
+    }
+
+    eprintln!(
+        "[nest] embedding query with {} via {}",
+        model,
+        embedder.display()
+    );
+    let out = ProcCommand::new("python3")
+        .arg(&embedder)
+        .arg(&model)
+        .arg(&query)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to spawn embedder: {} ({})", e, embedder.display()))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "embedder failed (status={}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let qvec: Vec<f32> = serde_json::from_slice(&out.stdout).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid embedder output: {} (stdout={:?})",
+            e,
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })?;
+    if qvec.len() != declared_dim {
+        anyhow::bail!(
+            "embedder produced dim={}, manifest declares dim={}; model mismatch?",
+            qvec.len(),
+            declared_dim
+        );
+    }
+
+    let cand = candidates.unwrap_or(((k as usize) * 4).max(64));
+    let result = match runtime.declared_index_type() {
+        "hnsw" => runtime.search_ann(&qvec, k, cand)?,
+        "hybrid" => runtime.search_hybrid(&qvec, &query, k, cand)?,
+        _ => runtime.search(&qvec, k)?,
+    };
+    print_result(&result);
+    Ok(())
+}
+
+fn cmd_search_ann(file: PathBuf, query: String, k: i32, ef: usize) -> Result<()> {
+    let runtime = nest_runtime::MmapNestFile::open(&file)?;
+    let qvec: Vec<f32> =
+        serde_json::from_str(&query).map_err(|e| anyhow::anyhow!("invalid query JSON: {}", e))?;
+    let result = runtime.search_ann(&qvec, k, ef)?;
+    print_result(&result);
+    Ok(())
+}
+
+fn print_result(result: &nest_runtime::SearchResult) {
     println!("index_type:   {}", result.index_type);
-    println!("recall:       {}", result.recall);
+    if !result.recall.is_nan() {
+        println!("recall:       {}", result.recall);
+    } else {
+        println!("recall:       (not computed; rerank guarantees real cosine)");
+    }
     println!("truncated:    {}", result.truncated);
     println!("k_requested:  {}", result.k_requested);
     println!("k_returned:   {}", result.k_returned);
@@ -135,10 +268,9 @@ fn cmd_search(file: PathBuf, query: String, k: i32) -> Result<()> {
             hit.citation_id,
         );
     }
-    Ok(())
 }
 
-fn cmd_benchmark(file: PathBuf, n_queries: usize, k: i32) -> Result<()> {
+fn cmd_benchmark(file: PathBuf, n_queries: usize, k: i32, ann_ef: Option<usize>) -> Result<()> {
     let runtime = nest_runtime::MmapNestFile::open(&file)?;
     let dim = runtime.embedding_dim();
 
@@ -154,35 +286,80 @@ fn cmd_benchmark(file: PathBuf, n_queries: usize, k: i32) -> Result<()> {
         queries.push(q);
     }
 
-    let mut times = Vec::with_capacity(n_queries);
-    for q in &queries {
-        let t0 = std::time::Instant::now();
-        let res = runtime.search(q, k)?;
-        // Recall is contractually 1.0 for exact search; if the runtime ever
-        // disagrees, surface it as an error rather than panicking the bench.
-        if res.recall != 1.0 {
-            return Err(anyhow::anyhow!(
-                "exact search returned recall={} (expected 1.0)",
-                res.recall
-            ));
+    let exact_times = run_bench(&runtime, &queries, k, "exact", |rt, q| rt.search(q, k))?;
+    println!(
+        "Exact ({} queries, dim={}, dtype={}, simd={}):",
+        n_queries,
+        dim,
+        runtime.dtype().name(),
+        runtime.simd_backend().name()
+    );
+    print_latency(&exact_times);
+
+    if let Some(ef) = ann_ef {
+        if !runtime.has_ann() {
+            println!("(no HNSW section — ANN bench skipped)");
+            return Ok(());
         }
+        let ann_times = run_bench(&runtime, &queries, k, "ann", |rt, q| {
+            rt.search_ann(q, k, ef)
+        })?;
+        println!("ANN ef={} ({} queries):", ef, n_queries);
+        print_latency(&ann_times);
+
+        // Recall@k of ANN vs exact, computed on the same queries.
+        let mut hits_overlap_total = 0.0f64;
+        for q in &queries {
+            let exact = runtime.search(q, k)?;
+            let approx = runtime.search_ann(q, k, ef)?;
+            let exact_set: std::collections::HashSet<&str> =
+                exact.hits.iter().map(|h| h.chunk_id.as_str()).collect();
+            let overlap = approx
+                .hits
+                .iter()
+                .filter(|h| exact_set.contains(h.chunk_id.as_str()))
+                .count();
+            hits_overlap_total += overlap as f64 / k as f64;
+        }
+        println!(
+            "  recall@{} (ANN vs exact): {:.4}",
+            k,
+            hits_overlap_total / n_queries as f64
+        );
+    }
+    Ok(())
+}
+
+fn run_bench(
+    rt: &nest_runtime::MmapNestFile,
+    queries: &[Vec<f32>],
+    _k: i32,
+    _label: &str,
+    mut f: impl FnMut(
+        &nest_runtime::MmapNestFile,
+        &[f32],
+    ) -> Result<nest_runtime::SearchResult, nest_runtime::RuntimeError>,
+) -> Result<Vec<f64>> {
+    let mut times = Vec::with_capacity(queries.len());
+    for q in queries {
+        let t0 = std::time::Instant::now();
+        f(rt, q)?;
         times.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
-
     times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(times)
+}
+
+fn print_latency(times: &[f64]) {
     let p = |q: f64| -> f64 {
         let idx = ((times.len() as f64 - 1.0) * q).round() as usize;
         times[idx]
     };
     let mean = times.iter().sum::<f64>() / times.len() as f64;
-
-    println!("Benchmark: {} random queries, k={}", n_queries, k);
     println!("  mean:   {:.3} ms", mean);
     println!("  p50:    {:.3} ms", p(0.50));
     println!("  p95:    {:.3} ms", p(0.95));
     println!("  p99:    {:.3} ms", p(0.99));
-    println!("  recall: 1.0 (exact)");
-    Ok(())
 }
 
 fn cmd_cite(file: PathBuf, citation: String) -> Result<()> {
@@ -213,7 +390,7 @@ fn cmd_cite(file: PathBuf, citation: String) -> Result<()> {
 
     let n = view.header.n_chunks as usize;
     let ids = nest_format::sections::decode_chunk_ids(
-        view.get_section_data(nest_format::layout::SECTION_CHUNK_IDS)?,
+        &view.decoded_section(nest_format::layout::SECTION_CHUNK_IDS)?,
         n,
     )?;
     let idx = ids
@@ -222,11 +399,11 @@ fn cmd_cite(file: PathBuf, citation: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("chunk_id {} not found in file", chunk_id))?;
 
     let texts = nest_format::sections::decode_chunks_canonical(
-        view.get_section_data(nest_format::layout::SECTION_CHUNKS_CANONICAL)?,
+        &view.decoded_section(nest_format::layout::SECTION_CHUNKS_CANONICAL)?,
         n,
     )?;
     let spans = nest_format::sections::decode_chunks_original_spans(
-        view.get_section_data(nest_format::layout::SECTION_CHUNKS_ORIGINAL_SPANS)?,
+        &view.decoded_section(nest_format::layout::SECTION_CHUNKS_ORIGINAL_SPANS)?,
         n,
     )?;
 
@@ -258,18 +435,54 @@ fn cmd_stats(file: PathBuf) -> Result<()> {
     println!("score_type:   {}", view.manifest.score_type);
     println!("normalize:    {}", view.manifest.normalize);
     println!("index_type:   {}", view.manifest.index_type);
+    println!("rerank:       {}", view.manifest.rerank_policy);
     println!("model:        {}", view.manifest.embedding_model);
     println!("model_hash:   {}", view.manifest.model_hash);
     println!("chunker:      {}", view.manifest.chunker_version);
+    println!("supports_ann: {}", view.manifest.capabilities.supports_ann);
+    println!("supports_bm25:{}", view.manifest.capabilities.supports_bm25);
+    println!(
+        "simd_backend: {}",
+        nest_runtime::simd::detect_backend().name()
+    );
     println!("sections:     {}", view.section_table.len());
     for entry in &view.section_table {
         let name = nest_format::layout::section_name(entry.section_id).unwrap_or("unknown");
+        let enc = encoding_name(entry.encoding);
         println!(
-            "  0x{:02x} {:<24} {} bytes",
-            entry.section_id, name, entry.size
+            "  0x{:02x} {:<24} encoding={:<8} {} bytes",
+            entry.section_id, name, enc, entry.size
         );
     }
     println!("file_hash:    {}", view.file_hash_hex());
     println!("content_hash: {}", view.content_hash_hex()?);
     Ok(())
+}
+
+fn encoding_name(e: u32) -> &'static str {
+    match e {
+        nest_format::layout::SECTION_ENCODING_RAW => "raw",
+        nest_format::layout::SECTION_ENCODING_ZSTD => "zstd",
+        nest_format::layout::SECTION_ENCODING_FLOAT16 => "float16",
+        nest_format::layout::SECTION_ENCODING_INT8 => "int8",
+        _ => "unknown",
+    }
+}
+
+/// Walk up from CARGO_MANIFEST_DIR / current dir to find python/embed_query.py.
+fn default_embedder_path() -> PathBuf {
+    let candidates = [
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("python").join("embed_query.py")),
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("..").join("python").join("embed_query.py")),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if c.exists() {
+            return c;
+        }
+    }
+    PathBuf::from("python/embed_query.py")
 }
