@@ -36,8 +36,7 @@ Thumbs.db
 
 # Project specific
 /database
-/data/*.nest
-/data/*.nest-*
+
 
 kdb/
 adr/
