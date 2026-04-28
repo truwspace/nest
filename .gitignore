@@ -35,7 +35,14 @@ Thumbs.db
 *~
 
 # Project specific
-# database/ and data/*.nest are tracked via Git LFS (see .gitattributes)
+# database/ and data/corpus_next.v1.nest are tracked via Git LFS.
+# Per-phase preset .nest files (data/measure/corpus_*.nest) are
+# regeneration artifacts: re-derivable in minutes by measure_presets.py
+# from the LFS-tracked baseline. Do NOT commit them — they'd inflate the
+# LFS bandwidth quota every phase. We commit only the JSON checksums and
+# metrics next to them.
+data/measure/corpus_*.nest
+data/measure/*.nest-*
 
 kdb/
 adr/

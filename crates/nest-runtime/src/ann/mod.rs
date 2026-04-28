@@ -1,0 +1,183 @@
+//! Pure-Rust HNSW index for approximate nearest neighbor search.
+//!
+//! This is a minimal, self-contained HNSW implementation tailored to
+//! `.nest`'s contract:
+//!
+//! - Vectors are L2-normalized → distance is `1 - cosine` (smaller = closer).
+//! - Index lives in section `0x07` and is bit-equal across rebuilds.
+//! - Search returns a candidate set; the runtime reranks with the exact
+//!   dot product against the embeddings section so the final score is
+//!   the real cosine.
+//!
+//! On-disk layout (`encoding=raw`, payload version 1):
+//!
+//! ```text
+//!   u32 LE  payload_version = 1
+//!   u32 LE  m                 — out-degree at non-zero levels
+//!   u32 LE  m_max0            — out-degree at level 0 (typically 2*m)
+//!   u32 LE  ef_construction
+//!   u32 LE  entry_point       — node id of the entry vertex
+//!   u32 LE  max_level         — highest layer with any node (0-based)
+//!   u32 LE  n_nodes           — equal to header.n_embeddings
+//!   for each node i in 0..n_nodes:
+//!       u32 LE  level_i       — top layer this node lives in
+//!       for layer in 0..=level_i:
+//!           u32 LE  k_i_l     — neighbor count at this layer
+//!           u32 LE * k_i_l    — neighbor ids
+//! ```
+//!
+//! Construction uses HNSW (Malkov & Yashunin, 2018) with a deterministic
+//! level distribution so the same input produces the same graph.
+//! Neighbor selection lives in `select_neighbors`; today it uses the
+//! `_simple` variant (top-m by distance), Phase 2 swaps in the
+//! Algorithm 4 heuristic for higher recall.
+
+mod build;
+mod codec;
+mod search;
+pub mod select_neighbors;
+
+pub const HNSW_PAYLOAD_VERSION: u32 = 1;
+
+/// Default neighbor count at non-zero layers. 16 is a common HNSW sweet
+/// spot for ~1M points; for smaller corpora the recall-vs-size curve is
+/// flat enough that the default is fine.
+pub const DEFAULT_M: usize = 16;
+/// Default candidate-list size during construction. Larger = better
+/// recall, slower build.
+pub const DEFAULT_EF_CONSTRUCTION: usize = 200;
+
+#[derive(Clone, Debug)]
+pub(super) struct Node {
+    /// Top layer this node lives in (0-based).
+    pub level: u32,
+    /// `neighbors[layer][i]` is the i-th neighbor id at `layer`. Index 0
+    /// is the densest layer (level 0).
+    pub neighbors: Vec<Vec<u32>>,
+}
+
+/// A built HNSW index. Reads borrow from the on-disk payload at open
+/// time; the graph is owned (small relative to embeddings).
+pub struct HnswIndex {
+    pub m: usize,
+    pub m_max0: usize,
+    pub ef_construction: usize,
+    pub entry_point: u32,
+    pub max_level: u32,
+    pub(super) nodes: Vec<Node>,
+    /// A snapshot of the f32 vectors used at search time. We copy
+    /// because we want the ANN graph to be dtype-independent: f16/i8
+    /// runtimes still get the same recall curve. Cost: ~n*dim*4 bytes
+    /// of RAM beyond the mmap.
+    pub(super) vectors: Vec<f32>,
+    pub(super) dim: usize,
+    pub(super) n: usize,
+    /// `ef_search` default. Caller can override per query.
+    pub ef_search: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Candidate {
+    pub id: u32,
+    /// `1 - cosine`. Smaller = closer.
+    pub dist: f32,
+}
+
+impl Eq for Candidate {}
+
+#[inline]
+pub(super) fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
+    // Vectors are L2-normalized → cosine = dot. Distance = 1 - cosine.
+    let mut dot = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+    }
+    1.0 - dot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ann::build::LcgRng;
+    use std::collections::HashSet;
+
+    pub(super) fn random_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut rng = LcgRng::new(seed);
+        let mut v = Vec::with_capacity(n * dim);
+        for _ in 0..(n * dim) {
+            v.push((rng.next_f64() as f32) - 0.5);
+        }
+        // L2-normalize each row.
+        for i in 0..n {
+            let row = &mut v[i * dim..(i + 1) * dim];
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in row.iter_mut() {
+                    *x /= norm;
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn small_index_recall_against_exact() {
+        // 200 random vectors, dim 32. Recall@10 vs exact should be very
+        // high — small enough that the graph is fully connected.
+        let n = 200;
+        let dim = 32;
+        let vecs = random_vectors(n, dim, 0xDEAD_BEEF);
+        let idx = HnswIndex::build(vecs.clone(), n, dim, 8, 50, 42);
+
+        let q = random_vectors(1, dim, 0xCAFEBABE);
+        // Exact top-10.
+        let mut exact: Vec<(usize, f32)> = (0..n)
+            .map(|i| {
+                let row = &vecs[i * dim..(i + 1) * dim];
+                let mut s = 0.0f32;
+                for j in 0..dim {
+                    s += q[j] * row[j];
+                }
+                (i, s)
+            })
+            .collect();
+        exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let exact_top: HashSet<usize> = exact.iter().take(10).map(|p| p.0).collect();
+        let approx = idx.search(&q, 50);
+        let approx_set: HashSet<usize> = approx.into_iter().take(10).collect();
+        let overlap = exact_top.intersection(&approx_set).count();
+        assert!(
+            overlap >= 7,
+            "recall@10 too low: {} of 10 (expected >= 7)",
+            overlap
+        );
+    }
+
+    #[test]
+    fn serialize_roundtrip() {
+        let n = 50;
+        let dim = 16;
+        let vecs = random_vectors(n, dim, 7);
+        let idx = HnswIndex::build(vecs.clone(), n, dim, 8, 30, 42);
+        let bytes = idx.to_bytes();
+        let mut decoded = HnswIndex::from_bytes(&bytes, n, dim).unwrap();
+        decoded.attach_vectors(vecs);
+        // Same query should produce a similar candidate set.
+        let q: Vec<f32> = vec![1.0 / (dim as f32).sqrt(); dim];
+        let a = idx.search(&q, 20);
+        let b = decoded.search(&q, 20);
+        let a_set: HashSet<usize> = a.into_iter().collect();
+        let b_set: HashSet<usize> = b.into_iter().collect();
+        assert_eq!(a_set, b_set, "candidate sets must match after roundtrip");
+    }
+
+    #[test]
+    fn deterministic_build_same_seed() {
+        let n = 30;
+        let dim = 8;
+        let vecs = random_vectors(n, dim, 0xABCD);
+        let a = HnswIndex::build(vecs.clone(), n, dim, 4, 20, 123);
+        let b = HnswIndex::build(vecs, n, dim, 4, 20, 123);
+        assert_eq!(a.to_bytes(), b.to_bytes(), "same seed => same graph");
+    }
+}
