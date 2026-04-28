@@ -1,0 +1,213 @@
+//! `NestFileBuilder::build_bytes` — orchestrates manifest validation,
+//! payload encoding, layout planning, buffer assembly, and final
+//! checksums + file_hash. Result is byte-deterministic for identical
+//! inputs (and `reproducible(true)`).
+
+use super::NestFileBuilder;
+use super::REPRODUCIBLE_CREATED;
+use super::payload::{encode_embeddings_payload, maybe_zstd};
+use crate::chunk::{chunk_id, validate_chunk};
+use crate::error::NestError;
+use crate::layout::{
+    NEST_FOOTER_SIZE, NEST_HEADER_SIZE, NEST_SECTION_ENTRY_SIZE, NestFooter, NestHeader,
+    REQUIRED_SECTIONS, SECTION_ALIGNMENT, SECTION_BM25_INDEX, SECTION_CHUNK_IDS,
+    SECTION_CHUNKS_CANONICAL, SECTION_CHUNKS_ORIGINAL_SPANS, SECTION_EMBEDDINGS,
+    SECTION_ENCODING_RAW, SECTION_HNSW_INDEX, SECTION_PROVENANCE, SECTION_SEARCH_CONTRACT,
+    SectionEntry, align_up,
+};
+use crate::sections::{
+    OriginalSpan, SearchContract, encode_chunk_ids, encode_chunks_canonical,
+    encode_chunks_original_spans, encode_provenance, encode_search_contract,
+};
+use sha2::{Digest, Sha256};
+
+impl NestFileBuilder {
+    /// Build the file in memory. Pure computation — no I/O.
+    pub fn build_bytes(mut self) -> crate::Result<Vec<u8>> {
+        if self.reproducible {
+            self.manifest.created = Some(REPRODUCIBLE_CREATED.into());
+        }
+        // 1. Validate manifest (rejects bad dtype/metric/etc up front).
+        self.manifest.validate()?;
+
+        // 2. Validate chunks against the manifest's embedding_dim and n_chunks.
+        let embedding_dim = self.manifest.embedding_dim as usize;
+        if self.chunks.len() as u64 != self.manifest.n_chunks {
+            return Err(NestError::ManifestInvalid(format!(
+                "n_chunks={} but builder has {} chunks",
+                self.manifest.n_chunks,
+                self.chunks.len()
+            )));
+        }
+        for c in &self.chunks {
+            validate_chunk(c, embedding_dim)?;
+        }
+
+        // 3. Derive section payloads.
+        let chunk_ids: Vec<String> = self
+            .chunks
+            .iter()
+            .map(|c| {
+                chunk_id(
+                    &c.canonical_text,
+                    &c.source_uri,
+                    c.byte_start,
+                    c.byte_end,
+                    &self.manifest.chunker_version,
+                )
+            })
+            .collect();
+
+        let canonical_texts: Vec<String> = self
+            .chunks
+            .iter()
+            .map(|c| c.canonical_text.clone())
+            .collect();
+        let original_spans: Vec<OriginalSpan> = self
+            .chunks
+            .iter()
+            .map(|c| OriginalSpan {
+                source_uri: c.source_uri.clone(),
+                byte_start: c.byte_start,
+                byte_end: c.byte_end,
+            })
+            .collect();
+
+        let embeddings_bytes = encode_embeddings_payload(self.dtype, &self.chunks, embedding_dim)?;
+
+        let contract = SearchContract {
+            metric: self.manifest.metric.clone(),
+            score_type: self.manifest.score_type.clone(),
+            normalize: self.manifest.normalize.clone(),
+            index_type: self.manifest.index_type.clone(),
+            rerank_policy: self.manifest.rerank_policy.clone(),
+        };
+
+        // (id, encoding, payload). chunk_ids stays raw (high-entropy SHA-256
+        // hex strings, near-incompressible), embeddings get dtype-specific
+        // encoding, everything else honors `text_encoding`.
+        let text_enc = self.text_encoding;
+        let mut sections: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(8);
+        sections.push((
+            SECTION_CHUNK_IDS,
+            SECTION_ENCODING_RAW,
+            encode_chunk_ids(&chunk_ids)?,
+        ));
+        sections.push(maybe_zstd(
+            SECTION_CHUNKS_CANONICAL,
+            text_enc,
+            encode_chunks_canonical(&canonical_texts)?,
+        )?);
+        sections.push(maybe_zstd(
+            SECTION_CHUNKS_ORIGINAL_SPANS,
+            text_enc,
+            encode_chunks_original_spans(&original_spans)?,
+        )?);
+        sections.push((SECTION_EMBEDDINGS, self.dtype.encoding(), embeddings_bytes));
+        sections.push(maybe_zstd(
+            SECTION_PROVENANCE,
+            text_enc,
+            encode_provenance(&self.provenance)?,
+        )?);
+        sections.push(maybe_zstd(
+            SECTION_SEARCH_CONTRACT,
+            text_enc,
+            encode_search_contract(&contract)?,
+        )?);
+
+        if let Some(payload) = self.hnsw_index.take() {
+            // HNSW is binary, mostly random — zstd would barely help and
+            // would defeat mmap-friendly reads. Always raw.
+            sections.push((SECTION_HNSW_INDEX, SECTION_ENCODING_RAW, payload));
+        }
+        if let Some(payload) = self.bm25_index.take() {
+            // BM25 posting lists are integer-heavy; zstd usually halves
+            // them. Honor text_encoding here too.
+            sections.push(maybe_zstd(SECTION_BM25_INDEX, text_enc, payload)?);
+        }
+
+        // Sanity: every required section is present (writer never drops one).
+        debug_assert!(
+            REQUIRED_SECTIONS
+                .iter()
+                .all(|(id, _)| sections.iter().any(|s| s.0 == *id))
+        );
+
+        // 4. Manifest JSON (canonical).
+        let manifest_json = self.manifest.to_canonical_json()?;
+
+        // 5. Layout offsets. Each section starts at SECTION_ALIGNMENT.
+        sections.sort_by_key(|s| s.0);
+        let section_table_count = sections.len() as u64;
+        let section_table_size = section_table_count * NEST_SECTION_ENTRY_SIZE as u64;
+        let header_size = NEST_HEADER_SIZE as u64;
+        let manifest_offset = header_size + section_table_size;
+        let manifest_size = manifest_json.len() as u64;
+
+        let mut section_entries: Vec<SectionEntry> = Vec::with_capacity(sections.len());
+        let mut current_offset = align_up(manifest_offset + manifest_size, SECTION_ALIGNMENT);
+        for (id, encoding, data) in &sections {
+            let mut entry = SectionEntry::new(*id, current_offset, data.len() as u64);
+            entry.encoding = *encoding;
+            section_entries.push(entry);
+            let after = current_offset + data.len() as u64;
+            current_offset = align_up(after, SECTION_ALIGNMENT);
+        }
+
+        // After the last section we want the footer immediately, so use
+        // the unaligned end of the last section's data.
+        let last_section_end = match (section_entries.last(), sections.last()) {
+            (Some(entry), Some((_, _, data))) => entry.offset + data.len() as u64,
+            _ => manifest_offset + manifest_size,
+        };
+        let data_end = last_section_end as usize;
+        let file_size = data_end + NEST_FOOTER_SIZE;
+        let mut buf = vec![0u8; file_size];
+
+        // 6. Write header (placeholder; checksum recomputed at end).
+        let mut header = NestHeader::new(
+            self.manifest.embedding_dim,
+            self.manifest.n_chunks,
+            self.chunks.len() as u64,
+            file_size as u64,
+            header_size,
+            section_table_count,
+            manifest_offset,
+            manifest_size,
+        );
+        buf[..NEST_HEADER_SIZE].copy_from_slice(header.as_bytes());
+
+        // 7. Write section table (placeholder checksums; filled below).
+        for (i, entry) in section_entries.iter().enumerate() {
+            let off = NEST_HEADER_SIZE + i * NEST_SECTION_ENTRY_SIZE;
+            buf[off..off + NEST_SECTION_ENTRY_SIZE].copy_from_slice(entry.as_bytes());
+        }
+
+        // 8. Write manifest.
+        let manifest_off = manifest_offset as usize;
+        buf[manifest_off..manifest_off + manifest_json.len()].copy_from_slice(&manifest_json);
+
+        // 9. Write section data at its declared (aligned) offset and
+        //    compute checksums over data only — padding stays zero and
+        //    is not hashed. Section checksum hashes the **physical** bytes
+        //    on disk (so for zstd sections it's over the compressed bytes).
+        for (i, (_, _, data)) in sections.iter().enumerate() {
+            let entry_off = NEST_HEADER_SIZE + i * NEST_SECTION_ENTRY_SIZE;
+            let data_off = section_entries[i].offset as usize;
+            buf[data_off..data_off + data.len()].copy_from_slice(data);
+            let hash = Sha256::digest(data);
+            buf[entry_off + 24..entry_off + 32].copy_from_slice(&hash[..8]);
+        }
+
+        // 10. Footer hash (covers everything before footer).
+        let footer_hash = NestFooter::compute_file_hash(&buf[..data_end]);
+        buf[data_end..data_end + 8].copy_from_slice(&NEST_FOOTER_SIZE.to_le_bytes());
+        buf[data_end + 8..file_size].copy_from_slice(&footer_hash);
+
+        // 11. Recompute header checksum (file_size already final).
+        header.compute_checksum();
+        buf[..NEST_HEADER_SIZE].copy_from_slice(header.as_bytes());
+
+        Ok(buf)
+    }
+}
