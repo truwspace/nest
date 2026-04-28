@@ -26,7 +26,10 @@ enum Commands {
     },
     /// Search by raw text — embeds the query with the model declared in
     /// the manifest, then runs the appropriate vector path. Honors the
-    /// declared `index_type` (exact / hnsw / hybrid).
+    /// declared `index_type` (exact / hnsw / hybrid). Validates the
+    /// embedder's model_hash against the manifest before running search;
+    /// a mismatch fails with a typed error rather than returning
+    /// silently-bad results.
     SearchText {
         file: PathBuf,
         query: String,
@@ -38,6 +41,21 @@ enum Commands {
         /// `ef` (HNSW) / candidates-per-path (hybrid). Default: 4*k or 64.
         #[arg(long)]
         candidates: Option<usize>,
+        /// Local path to the model snapshot dir. Use this for fully
+        /// offline operation: copy the model dir alongside the .nest,
+        /// pass --model-path at every search. Without this, the
+        /// embedder resolves the model from the sentence-transformers
+        /// cache (requires network on first use).
+        #[arg(long)]
+        model_path: Option<PathBuf>,
+        /// Skip model_hash validation. ONLY use when intentionally
+        /// running search-text against a corpus whose `model_hash`
+        /// is the legacy zero-placeholder (pre-Phase-3 builds). In
+        /// that case the search is still cosine-valid IF the user
+        /// genuinely uses the same embedding model — but there is
+        /// no guarantee. Prefer rebuilding the corpus.
+        #[arg(long)]
+        skip_model_hash_check: bool,
     },
     /// Force the ANN (HNSW) path. Falls back to exact if the file has
     /// no HNSW section.
@@ -83,7 +101,17 @@ fn main() -> Result<()> {
             k,
             embedder,
             candidates,
-        } => cmd_search_text(file, query, k, embedder, candidates),
+            model_path,
+            skip_model_hash_check,
+        } => cmd_search_text(
+            file,
+            query,
+            k,
+            embedder,
+            candidates,
+            model_path,
+            skip_model_hash_check,
+        ),
         Commands::SearchAnn { file, query, k, ef } => cmd_search_ann(file, query, k, ef),
         Commands::Benchmark {
             file,
@@ -158,16 +186,37 @@ fn cmd_search(file: PathBuf, query: String, k: i32) -> Result<()> {
     Ok(())
 }
 
+/// Output schema produced by `python/embed_query.py`.
+#[derive(serde::Deserialize)]
+struct EmbedderOutput {
+    model_hash: String,
+    embedding_model: String,
+    embedding_dim: usize,
+    vector: Vec<f32>,
+    /// Full structured fingerprint — included here for diagnostics on
+    /// mismatch but not validated field-by-field (the compact
+    /// `model_hash` is the source of truth).
+    #[serde(default)]
+    fingerprint: serde_json::Value,
+}
+
+/// Legacy zero placeholder; pre-Phase-3 corpora may have this. Caller
+/// can opt out of strict validation via `--skip-model-hash-check` to
+/// search them.
+const PLACEHOLDER_MODEL_HASH: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_search_text(
     file: PathBuf,
     query: String,
     k: i32,
     embedder: Option<PathBuf>,
     candidates: Option<usize>,
+    model_path: Option<PathBuf>,
+    skip_model_hash_check: bool,
 ) -> Result<()> {
     let runtime = nest_runtime::MmapNestFile::open(&file)?;
-    // Read manifest model name from inspect_json so we don't open the
-    // file twice.
     let info: serde_json::Value = serde_json::from_str(&runtime.inspect_json()?)?;
     let model = info["manifest"]["embedding_model"]
         .as_str()
@@ -177,6 +226,10 @@ fn cmd_search_text(
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("manifest.embedding_dim missing"))?
         as usize;
+    let declared_model_hash = info["manifest"]["model_hash"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("manifest.model_hash missing"))?
+        .to_string();
 
     let embedder = embedder.unwrap_or_else(default_embedder_path);
     if !embedder.exists() {
@@ -187,14 +240,21 @@ fn cmd_search_text(
     }
 
     eprintln!(
-        "[nest] embedding query with {} via {}",
+        "[nest] embedding query with {} via {}{}",
         model,
-        embedder.display()
+        embedder.display(),
+        match &model_path {
+            Some(p) => format!(" (--model-path {})", p.display()),
+            None => String::new(),
+        }
     );
-    let out = ProcCommand::new("python3")
-        .arg(&embedder)
-        .arg(&model)
-        .arg(&query)
+    let mut cmd = ProcCommand::new("python3");
+    cmd.arg(&embedder);
+    if let Some(p) = &model_path {
+        cmd.arg("--model-path").arg(p);
+    }
+    cmd.arg(&model).arg(&query);
+    let out = cmd
         .output()
         .map_err(|e| anyhow::anyhow!("failed to spawn embedder: {} ({})", e, embedder.display()))?;
     if !out.status.success() {
@@ -204,26 +264,60 @@ fn cmd_search_text(
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let qvec: Vec<f32> = serde_json::from_slice(&out.stdout).map_err(|e| {
+    let payload: EmbedderOutput = serde_json::from_slice(&out.stdout).map_err(|e| {
         anyhow::anyhow!(
             "invalid embedder output: {} (stdout={:?})",
             e,
             String::from_utf8_lossy(&out.stdout)
         )
     })?;
-    if qvec.len() != declared_dim {
+
+    // Layer 1: name match (cheap; catches obvious mistakes).
+    if payload.embedding_model != model {
         anyhow::bail!(
-            "embedder produced dim={}, manifest declares dim={}; model mismatch?",
-            qvec.len(),
-            declared_dim
+            "model name mismatch: manifest={}, embedder reports={}",
+            model,
+            payload.embedding_model
         );
+    }
+    // Layer 2: dim match (cheap; catches dim collisions).
+    if payload.embedding_dim != declared_dim || payload.vector.len() != declared_dim {
+        anyhow::bail!(
+            "dim mismatch: manifest={}, embedder dim={}, vector len={}",
+            declared_dim,
+            payload.embedding_dim,
+            payload.vector.len()
+        );
+    }
+    // Layer 3: model_hash match (the strict check; catches "same name,
+    // same dim, different snapshot" silent failures).
+    if !skip_model_hash_check {
+        if declared_model_hash == PLACEHOLDER_MODEL_HASH {
+            anyhow::bail!(
+                "manifest carries the legacy placeholder model_hash ({}). Rebuild \
+                 this corpus with a real fingerprint, or pass --skip-model-hash-check \
+                 to proceed at your own risk.",
+                PLACEHOLDER_MODEL_HASH
+            );
+        }
+        if payload.model_hash != declared_model_hash {
+            anyhow::bail!(
+                "model_hash mismatch: corpus was built with {}, embedder reports {}\n\
+                 fingerprint reported by embedder: {}\n\
+                 hint: --model-path PATH to point at the exact snapshot, or rebuild \
+                 the corpus with the model you intend to use.",
+                declared_model_hash,
+                payload.model_hash,
+                payload.fingerprint
+            );
+        }
     }
 
     let cand = candidates.unwrap_or(((k as usize) * 4).max(64));
     let result = match runtime.declared_index_type() {
-        "hnsw" => runtime.search_ann(&qvec, k, cand)?,
-        "hybrid" => runtime.search_hybrid(&qvec, &query, k, cand)?,
-        _ => runtime.search(&qvec, k)?,
+        "hnsw" => runtime.search_ann(&payload.vector, k, cand)?,
+        "hybrid" => runtime.search_hybrid(&payload.vector, &query, k, cand)?,
+        _ => runtime.search(&payload.vector, k)?,
     };
     print_result(&result);
     Ok(())
