@@ -82,6 +82,7 @@ fn exact_topk(corpus: &[f32], n: usize, dim: usize, q: &[f32], k: usize) -> Vec<
     scored.into_iter().take(k).map(|(i, _)| i).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_recall(
     idx: &HnswIndex,
     corpus: &[f32],
