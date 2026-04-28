@@ -1,0 +1,165 @@
+"""Compare two `measure_presets.py --json` dumps against the project's
+regression gates and exit non-zero on any failure.
+
+Gates (all required to pass):
+
+  compressed.size_ratio   <= 0.40
+  tiny.size_ratio         <= 0.30
+  tiny.recall_at_k        >= 0.95
+  compressed.recall_at_k  >= 0.9999    (treated as "= 1.0")
+  hybrid.recall_at_k      >= 0.99
+  exact.p95_ms            <= baseline.exact.p95_ms * 1.50  (--p95-headroom)
+
+Tolerant of the legacy first-line print bug that lived in
+`measure_presets.py` between Phase 0 and Phase 2: we strip any leading
+non-JSON lines before parsing.
+
+Usage:
+    python python/tools/compare_measure.py BASELINE.json POST.json
+    echo $?   # 0 = all gates pass, 1 = any gate failed
+
+The "baseline" file is also used as the reference for exact.p95_ms.
+That makes the latency gate adaptive — production-realistic builds get
+the headroom they earned in the baseline run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def load_metrics(path: Path) -> dict:
+    """Load a measure_presets JSON dump.
+
+    Tolerates the Phase-0 bug where the script printed `baseline: ...`
+    to stdout before the JSON document, which corrupted the output.
+    Strips anything before the first `{`.
+    """
+    raw = path.read_text()
+    brace = raw.find("{")
+    if brace == -1:
+        raise SystemExit(f"{path}: no JSON object found")
+    return json.loads(raw[brace:])
+
+
+def by_preset(doc: dict) -> dict[str, dict]:
+    return {p["preset"]: p for p in doc.get("presets", [])}
+
+
+def fmt(val: float | int | None, width: int = 8, prec: int = 4) -> str:
+    if val is None:
+        return "-".rjust(width)
+    return f"{val:>{width}.{prec}f}"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Validate measure_presets output against regression gates."
+    )
+    ap.add_argument("baseline", type=Path, help="reference measure_presets JSON")
+    ap.add_argument("post", type=Path, help="new measure_presets JSON to validate")
+    ap.add_argument(
+        "--p95-headroom",
+        type=float,
+        default=1.50,
+        help=(
+            "multiplier on baseline.exact.p95_ms (default 1.50 = +50%%). "
+            "Wider than you'd expect because p95 over 50–100 queries is "
+            "noisy: a single OS hiccup pushes it 30%% in either direction. "
+            "The gate exists to catch real regressions (e.g. SIMD broken, "
+            "10× slowdown), not jitter."
+        ),
+    )
+    args = ap.parse_args()
+
+    base = load_metrics(args.baseline)
+    post = load_metrics(args.post)
+
+    base_p = by_preset(base)
+    post_p = by_preset(post)
+
+    needed = ["exact", "compressed", "tiny", "hybrid"]
+    for name in needed:
+        if name not in post_p:
+            print(f"ERROR: post is missing preset '{name}'", file=sys.stderr)
+            return 1
+
+    base_exact_p95 = base_p.get("exact", {}).get("p95_ms")
+    if base_exact_p95 is None:
+        print("ERROR: baseline.exact.p95_ms missing", file=sys.stderr)
+        return 1
+    p95_limit = base_exact_p95 * args.p95_headroom
+
+    gates = [
+        (
+            "compressed.size_ratio  ≤ 0.40",
+            post_p["compressed"]["size_ratio"] <= 0.40,
+            post_p["compressed"]["size_ratio"],
+        ),
+        (
+            "tiny.size_ratio        ≤ 0.30",
+            post_p["tiny"]["size_ratio"] <= 0.30,
+            post_p["tiny"]["size_ratio"],
+        ),
+        (
+            "tiny.recall_at_k       ≥ 0.95",
+            post_p["tiny"]["recall_at_k"] >= 0.95,
+            post_p["tiny"]["recall_at_k"],
+        ),
+        (
+            "compressed.recall_at_k = 1.000",
+            post_p["compressed"]["recall_at_k"] >= 0.9999,
+            post_p["compressed"]["recall_at_k"],
+        ),
+        (
+            "hybrid.recall_at_k     ≥ 0.99",
+            post_p["hybrid"]["recall_at_k"] >= 0.99,
+            post_p["hybrid"]["recall_at_k"],
+        ),
+        (
+            (
+                f"exact.p95_ms           ≤ {p95_limit:.3f} ms "
+                f"(baseline {base_exact_p95:.3f} × {args.p95_headroom})"
+            ),
+            post_p["exact"]["p95_ms"] <= p95_limit,
+            post_p["exact"]["p95_ms"],
+        ),
+    ]
+
+    # Pretty print the metrics side-by-side.
+    print(f"# baseline ({args.baseline.name}) → post ({args.post.name})")
+    print(f"  baseline n_queries={base.get('n_queries')}  post n_queries={post.get('n_queries')}")
+    print()
+    print(
+        f"{'preset':12s} {'size_MB':>10} {'size_ratio':>11} "
+        f"{'recall@10':>10} {'p50_ms':>8} {'p95_ms':>8} {'drift_max':>10}"
+    )
+    for name in needed:
+        p = post_p[name]
+        print(
+            f"{name:12s} {fmt(p['size_mb'], 10, 2)} {fmt(p['size_ratio'], 11, 3)} "
+            f"{fmt(p['recall_at_k'], 10, 4)} {fmt(p['p50_ms'], 8, 2)} "
+            f"{fmt(p['p95_ms'], 8, 2)} {fmt(p['drift_max'], 10, 6)}"
+        )
+    print()
+    print("## Regression gates")
+    failed = 0
+    for label, ok, val in gates:
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            failed += 1
+        print(f"  [{status}] {label} (got {val:.4f})")
+
+    print()
+    if failed == 0:
+        print("ALL GATES PASS")
+        return 0
+    print(f"FAIL: {failed} gate(s) failed")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
