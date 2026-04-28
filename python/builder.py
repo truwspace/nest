@@ -14,6 +14,7 @@ The chunker, embedder and emitter are deliberately decoupled so a caller
 can swap the embedding model or the chunking strategy without touching
 the rest of the pipeline.
 """
+
 from __future__ import annotations
 
 import json
@@ -21,8 +22,8 @@ import os
 import sqlite3
 import struct
 import sys
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Callable, Iterable, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nest
@@ -120,9 +121,7 @@ class EmbeddingCache:
         if row is None:
             return None
         if row[0] != dim:
-            raise ValueError(
-                f"chunk {chunk_id} cached with dim={row[0]}, requested dim={dim}"
-            )
+            raise ValueError(f"chunk {chunk_id} cached with dim={row[0]}, requested dim={dim}")
         return list(struct.unpack(f"<{dim}f", row[1]))
 
     def put(self, chunk_id: str, embedding: Sequence[float]) -> None:
@@ -156,8 +155,8 @@ class BuildConfig:
     #   "hybrid"     — zstd text, float32 embeddings, HNSW, BM25
     preset: str = "exact"
     # Per-knob overrides (None = inherit from preset)
-    text_encoding: str | None = None        # "raw" | "zstd"
-    dtype: str | None = None                # "float32" | "float16" | "int8"
+    text_encoding: str | None = None  # "raw" | "zstd"
+    dtype: str | None = None  # "float32" | "float16" | "int8"
     with_hnsw: bool | None = None
     with_bm25: bool | None = None
     hnsw_m: int = 16
@@ -220,7 +219,7 @@ class Pipeline:
                 raise RuntimeError(
                     f"embedder returned {len(new_embs)} embeddings for {len(misses)} chunks"
                 )
-            for spec, idx, emb in zip(misses, misses_idx, new_embs):
+            for spec, idx, emb in zip(misses, misses_idx, new_embs, strict=False):
                 if len(emb) != self.cfg.embedding_dim:
                     raise RuntimeError(
                         f"embedder produced dim={len(emb)}, expected {self.cfg.embedding_dim}"
@@ -245,7 +244,7 @@ class Pipeline:
                 byte_end=s.byte_end,
                 embedding=emb,
             )
-            for s, emb in zip(self._specs, embeddings)
+            for s, emb in zip(self._specs, embeddings, strict=False)
         ]
 
         if os.path.exists(self.cfg.output_path):
